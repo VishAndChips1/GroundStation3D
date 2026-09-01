@@ -1,25 +1,37 @@
 # Ground Station 3D
 
 Desktop base-station app for a mine/landfill survey rig. It polls the
-rover's HTTP point-cloud endpoint over WiFi, renders the live point cloud
-(camera RGB or a thermal overlay), and lets you save frames to disk.
+rover's HTTP point-cloud endpoint over WiFi and renders the live cloud with
+camera-RGB or thermal colouring, a metre-graduated scale grid, and an
+origin marker.
+
+Built on Qt (PySide6) + PyVista/VTK.
 
 ## Features
 
-- Live point cloud view (Open3D), updating as new frames arrive
-- Mouse controls: left-drag orbit, right/middle-drag pan, scroll to zoom
-- Coordinate axes and an optional reference grid, plus a one-click "Reset
-  View" to re-fit the camera to the current cloud
-- Point size slider
-- RGB / Thermal color overlay, auto-scaled to each frame's min/max
-  temperature
-- Save the current frame to a timestamped `.pcd` file
-- Live stats: data rate, points/sec, HTTP fetch time, frames received/dropped
+- **Live 3D point cloud**, updating as frames arrive
+- **Any sender, any network** — the rover IP/port are entered in the app
+  itself, so it works with a rig on WiFi, a WSL instance, or localhost
+  without touching the command line
+- **Colour overlays** — camera RGB, or thermal colour-mapped (`inferno`)
+  and auto-scaled to each frame's min/max, with points lacking a thermal
+  reading drawn grey
+- **Coordinate references** — corner orientation axes that rotate with the
+  camera, an origin triad at (0, 0, 0), and a graduated bounding box whose
+  metre tick labels rescale as you zoom
+- **Camera** — left-drag orbit, middle-drag pan, scroll/right-drag zoom,
+  plus Reset view and Top-down buttons
+- **Capture** — save the current frame as a timestamped `.pcd`, or save a
+  PNG of the viewport
+- **Live stats** — data rate, points/sec, points in frame, HTTP fetch time,
+  frames OK/failed
+- **Clear connection feedback** — connection refused / timed out / bad
+  frame are reported in plain language instead of failing silently
 
 ## Requirements
 
 - Python 3.10+
-- See `requirements.txt` (Open3D, NumPy, Matplotlib)
+- See `requirements.txt`
 
 ```bash
 python -m venv .venv
@@ -29,56 +41,47 @@ pip install -r requirements.txt
 
 ## Running
 
-**Windows:** double-click `Run Base Station.bat`, enter the rover's IP when
-prompted, and it launches with no console window.
+**Windows:** double-click `Run Base Station.bat`.
 
-**Any platform / from source:**
+**Any platform:**
 
 ```bash
-python main.py --rover-host <rover-ip>
+python main.py
 ```
 
-`--rover-host` is required -- it's the IP (or hostname) of the machine
-running the rover's HTTP server. Optional flags:
+Then type the rover's IP into **Rover host**, set the port (default 8080),
+and press **Connect**.
 
-- `--rover-port` (default `8080`)
-- `--poll-interval` (default `0.1`s) -- minimum time between
-  `GET /latest.bin` requests
+Optional flags (all also editable in the GUI):
+
+```bash
+python main.py --rover-host 192.168.1.50 --rover-port 8080 --connect
+```
+
+- `--rover-host` / `--rover-port` — pre-fill the connection fields
+- `--poll-interval` — minimum seconds between requests (default `0.2`)
+- `--connect` — connect immediately on startup
+
+### Finding the rover's IP
+
+- **Rig on WiFi:** whatever address the rover reports on the shared network.
+- **Sender running in WSL:** run `wsl hostname -I` in Windows PowerShell and
+  use that address (it changes when WSL restarts).
+- **Same machine:** `127.0.0.1`.
 
 ### Testing without the rover
 
-`tools/mock_rover_server.py` serves a synthetic spinning point cloud on the
-same endpoint shape, so you can exercise the whole app before hardware is
-available:
+`tools/mock_rover_server.py` serves a synthetic spinning cloud in the same
+binary format:
 
 ```bash
 python tools/mock_rover_server.py --port 8080
-python main.py --rover-host 127.0.0.1 --rover-port 8080
+python main.py --rover-host 127.0.0.1 --connect
 ```
-
-## Using the app
-
-- **Orbit / pan / zoom**: standard Open3D `SceneWidget` mouse controls --
-  nothing custom here, these come from Open3D itself.
-- **Point size**: slider in the side panel, applied live via the render
-  material.
-- **Color overlay**: RGB uses the camera color carried in each frame;
-  Thermal colormaps temperature (matplotlib `inferno`), auto-scaled to the
-  current frame's min/max (shown under the dropdown). Points with no
-  thermal reading render mid-gray.
-- **View**: toggle the axes triad or reference grid, or hit Reset View to
-  re-fit the camera to the current cloud.
-- **Save PCD**: writes the currently displayed frame to
-  `./captures/frame_<timestamp>.pcd` and shows a brief confirmation message.
-- **Live stats**: rolling ~1s data rate (KB/s and points/sec), HTTP fetch
-  time (how long each `GET /latest.bin` round-trip took), and frames
-  received/dropped (a "dropped" frame is a failed or malformed HTTP
-  response, not a decode of a partial one).
 
 ## Protocol / adapting to the real rover
 
-All parsing lives in `protocol.py`, isolated from rendering/GUI code in
-`main.py`. The rover currently serves:
+All parsing lives in `protocol.py`, isolated from the GUI. The rover serves:
 
 ```
 GET http://<rover-host>:<port>/latest.bin
@@ -86,26 +89,32 @@ GET http://<rover-host>:<port>/latest.bin
 Binary body (little-endian):
     uint32       N   -- point count
     float32[N][7]    -- x, y, z, r, g, b, thermal
-        xyz      meters
-        rgb      already normalized 0-1
+        xyz      metres
+        rgb      already normalised 0-1
         thermal  Kelvin, or NaN where unavailable
 ```
 
-Each request returns one complete frame -- no reassembly needed, since TCP
-already guarantees the body arrives whole. If the endpoint's layout changes
-again, `protocol.py` is the only file that should need editing; the rest of
-the app only depends on the `Frame` dataclass (`xyz`, `rgb`, `temp_c`)
-`parse_frame()` returns.
+Each request returns one complete frame — no reassembly needed, since TCP
+guarantees the body arrives whole. If the format changes, `protocol.py` is
+the only file that should need editing; everything else depends solely on
+the `Frame` dataclass (`xyz`, `rgb`, `temp_c`) that `parse_frame()` returns.
 
-The endpoint is currently capped at ~20k points (stride-sampled) for
-browser bandwidth. The rover's ROS side carries the full ~250k+ point cloud
-if that cap ever gets lifted -- this app doesn't assume a point count, so a
-larger frame from an uncapped endpoint should render as-is (expect a
-heavier per-frame payload and correspondingly lower achievable poll rate
-over WiFi).
+The endpoint is currently capped at ~20k points (stride-sampled) while the
+ROS side carries the full ~250k+ cloud. The app doesn't assume a point
+count, so an uncapped endpoint renders as-is — expect a heavier payload per
+frame and a correspondingly lower practical poll rate over WiFi.
+
+## Project layout
+
+| File | Purpose |
+| --- | --- |
+| `main.py` | Qt window, 3D view, polling thread, stats |
+| `protocol.py` | Wire format — the only file to touch if it changes |
+| `theme.py` | Dark theme stylesheet |
+| `tools/mock_rover_server.py` | Synthetic sender for testing without hardware |
 
 ## Non-goals
 
-- No accumulation across frames or SLAM/registration -- only the latest
-  complete frame is shown.
-- No authentication or encryption -- trusted LAN only.
+- No accumulation across frames, SLAM, or registration — only the latest
+  frame is shown.
+- No authentication or encryption — trusted LAN only.

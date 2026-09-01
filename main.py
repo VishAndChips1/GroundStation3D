@@ -1,13 +1,14 @@
 """Base station GUI for the mine/landfill survey rig.
 
 Polls the rover's HTTP point-cloud endpoint (xyz + rgb + thermal per point)
-and renders/saves the latest frame live. See protocol.py for the wire
-format and README.md for usage.
+and renders the latest frame live. Built on Qt (PySide6) + PyVista/VTK.
+
+See protocol.py for the wire format and README.md for usage.
 """
 
-import argparse
+import faulthandler
 import os
-import queue
+import sys
 import threading
 import time
 import urllib.error
@@ -15,462 +16,734 @@ import urllib.request
 from collections import deque
 from datetime import datetime
 
-import numpy as np
-import open3d as o3d
-import open3d.visualization.gui as gui
-import open3d.visualization.rendering as rendering
 import matplotlib
+import numpy as np
+import pyvista as pv
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSlider,
+    QSpinBox, QVBoxLayout, QWidget,
+)
+from pyvistaqt import QtInteractor
 
+import theme
 from protocol import Frame, MalformedFrameError, parse_frame
 
-GEOMETRY_NAME = "live_cloud"
 CAPTURES_DIR = "captures"
-STATUS_MESSAGE_SECONDS = 3.0
-THERMAL_COLORMAP_NAME = "inferno"
-INVALID_THERMAL_COLOR = (0.5, 0.5, 0.5)  # points with NaN thermal in Thermal mode
 FETCH_TIMEOUT_SECONDS = 2.0
+INVALID_THERMAL_COLOR = (128, 128, 128)  # gray for points with no thermal reading
+THERMAL_COLORMAP = "inferno"
+STATS_REFRESH_MS = 250
 
+
+# --------------------------------------------------------------------------
+# Networking
+# --------------------------------------------------------------------------
 
 class NetworkStats:
-    """Rolling-window rate/fetch-time/frame counters.
-
-    Written from the poller thread, read from the GUI thread. Plain int
-    counters are safe to read across threads under the GIL; the byte/point
-    logs are guarded by a lock since they're mutated with read-modify-write
-    logic.
-    """
+    """Rolling-window rate/fetch-time/frame counters, shared across threads."""
 
     def __init__(self, window_seconds: float = 1.0):
         self._lock = threading.Lock()
         self._window = window_seconds
-        self._byte_log = deque()   # (t, nbytes) per HTTP response received
-        self._point_log = deque()  # (t, npoints) per completed frame
+        self._byte_log = deque()   # (t, nbytes) per HTTP response
+        self._point_log = deque()  # (t, npoints) per decoded frame
         self.frames_received = 0
-        self.frames_dropped = 0
+        self.frames_failed = 0
         self.last_fetch_seconds = None
+        self.last_point_count = 0
 
-    def record_response(self, nbytes: int) -> None:
+    def record_frame(self, nbytes: int, npoints: int, fetch_seconds: float) -> None:
         now = time.time()
         with self._lock:
             self._byte_log.append((now, nbytes))
-            self._trim(self._byte_log, now)
-
-    def record_frame(self, npoints: int, fetch_seconds: float) -> None:
-        now = time.time()
-        with self._lock:
             self._point_log.append((now, npoints))
+            self._trim(self._byte_log, now)
             self._trim(self._point_log, now)
             self.frames_received += 1
             self.last_fetch_seconds = fetch_seconds
+            self.last_point_count = npoints
 
-    def add_dropped(self, n: int) -> None:
+    def record_failure(self) -> None:
         with self._lock:
-            self.frames_dropped += n
+            self.frames_failed += 1
+
+    def reset(self) -> None:
+        with self._lock:
+            self._byte_log.clear()
+            self._point_log.clear()
+            self.frames_received = 0
+            self.frames_failed = 0
+            self.last_fetch_seconds = None
+            self.last_point_count = 0
 
     def _trim(self, log: deque, now: float) -> None:
         cutoff = now - self._window
         while log and log[0][0] < cutoff:
             log.popleft()
 
-    def snapshot(self):
+    def snapshot(self) -> dict:
+        now = time.time()
         with self._lock:
-            byte_total = sum(n for _, n in self._byte_log)
-            point_total = sum(n for _, n in self._point_log)
+            self._trim(self._byte_log, now)
+            self._trim(self._point_log, now)
             return {
-                "kbps": (byte_total / 1024.0) / self._window,
-                "pts_per_sec": point_total / self._window,
+                "kbps": sum(n for _, n in self._byte_log) / 1024.0 / self._window,
+                "pts_per_sec": sum(n for _, n in self._point_log) / self._window,
                 "frames_received": self.frames_received,
-                "frames_dropped": self.frames_dropped,
+                "frames_failed": self.frames_failed,
                 "fetch_seconds": self.last_fetch_seconds,
+                "point_count": self.last_point_count,
             }
 
 
-def poller_thread_main(url, frame_queue, stats, stop_event, poll_interval):
-    frame_id = 0
-    while not stop_event.is_set():
-        start = time.time()
-        try:
-            with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_SECONDS) as resp:
-                data = resp.read()
-        except (urllib.error.URLError, OSError, TimeoutError):
-            stats.add_dropped(1)
-            stop_event.wait(poll_interval)
-            continue
+class PollWorker(QThread):
+    """Polls the rover endpoint on a background thread.
 
-        recv_time = time.time()
-        fetch_seconds = recv_time - start
-        stats.record_response(len(data))
+    Frames are handed to the GUI thread through a queued Qt signal, so no
+    GUI object is ever touched from here.
+    """
 
-        try:
-            frame = parse_frame(data, frame_id, recv_time, fetch_seconds)
-        except MalformedFrameError:
-            stats.add_dropped(1)
-            stop_event.wait(poll_interval)
-            continue
+    frame_ready = Signal(object)
+    state_changed = Signal(str, str)  # state ("live"/"waiting"/"error"), detail
 
-        frame_id += 1
-        stats.record_frame(frame.num_points, fetch_seconds)
-        try:
-            frame_queue.put_nowait(frame)
-        except queue.Full:
-            try:
-                frame_queue.get_nowait()
-            except queue.Empty:
-                pass
-            frame_queue.put_nowait(frame)
-
-        elapsed = time.time() - start
-        if elapsed < poll_interval:
-            stop_event.wait(poll_interval - elapsed)
-
-
-ACCENT_COLOR = gui.Color(0.16, 0.53, 0.87)
-SAVE_COLOR = gui.Color(0.18, 0.62, 0.36)
-DIM_TEXT_COLOR = gui.Color(0.65, 0.65, 0.65)
-PANEL_ACCENT_BG = gui.Color(0.20, 0.22, 0.26)
-STATS_REFRESH_SECONDS = 0.25
-
-
-class BaseStationApp:
-    def __init__(self, frame_queue, stats, source_url, on_close):
-        self._frame_queue = frame_queue
+    def __init__(self, url: str, poll_interval: float, stats: NetworkStats):
+        super().__init__()
+        self._url = url
+        self._poll_interval = poll_interval
         self._stats = stats
-        self._on_close_cb = on_close
+        self._stop_event = threading.Event()
+        self._last_state = None
 
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _emit_state(self, state: str, detail: str) -> None:
+        # Only emit on change, so the GUI isn't spammed while idling.
+        if (state, detail) != self._last_state:
+            self._last_state = (state, detail)
+            self.state_changed.emit(state, detail)
+
+    def run(self) -> None:
+        frame_id = 0
+        self._emit_state("waiting", "connecting...")
+
+        while not self._stop_event.is_set():
+            start = time.time()
+            try:
+                with urllib.request.urlopen(self._url, timeout=FETCH_TIMEOUT_SECONDS) as resp:
+                    data = resp.read()
+            except urllib.error.HTTPError as exc:
+                self._stats.record_failure()
+                self._emit_state("error", f"HTTP {exc.code} from server")
+                self._stop_event.wait(self._poll_interval)
+                continue
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                self._stats.record_failure()
+                self._emit_state("error", self._describe_error(exc))
+                self._stop_event.wait(self._poll_interval)
+                continue
+
+            recv_time = time.time()
+            fetch_seconds = recv_time - start
+
+            try:
+                frame = parse_frame(data, frame_id, recv_time, fetch_seconds)
+            except MalformedFrameError as exc:
+                self._stats.record_failure()
+                self._emit_state("error", f"bad frame: {exc}")
+                self._stop_event.wait(self._poll_interval)
+                continue
+
+            frame_id += 1
+            self._stats.record_frame(len(data), frame.num_points, fetch_seconds)
+            self._emit_state("live", f"{frame.num_points:,} points")
+            self.frame_ready.emit(frame)
+
+            elapsed = time.time() - start
+            if elapsed < self._poll_interval:
+                self._stop_event.wait(self._poll_interval - elapsed)
+
+    @staticmethod
+    def _describe_error(exc: Exception) -> str:
+        reason = getattr(exc, "reason", exc)
+        text = str(reason)
+        if "refused" in text.lower():
+            return "connection refused - is the rover server running?"
+        if "timed out" in text.lower() or isinstance(exc, TimeoutError):
+            return "timed out - check the IP and that you're on the same network"
+        if "unreachable" in text.lower():
+            return "host unreachable - check the IP"
+        return text[:80]
+
+
+# --------------------------------------------------------------------------
+# GUI helpers
+# --------------------------------------------------------------------------
+
+def make_divider() -> QFrame:
+    line = QFrame()
+    line.setObjectName("Divider")
+    line.setFrameShape(QFrame.HLine)
+    line.setFixedHeight(1)
+    return line
+
+
+def make_section_label(text: str) -> QLabel:
+    label = QLabel(text.upper())
+    label.setObjectName("SectionLabel")
+    return label
+
+
+class StatRow(QWidget):
+    """A caption on the left, a value on the right."""
+
+    def __init__(self, caption: str):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        cap = QLabel(caption)
+        cap.setObjectName("StatCaption")
+        self.value = QLabel("-")
+        self.value.setObjectName("StatValue")
+        self.value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(cap)
+        layout.addStretch()
+        layout.addWidget(self.value)
+
+    def set(self, text: str) -> None:
+        self.value.setText(text)
+
+
+# --------------------------------------------------------------------------
+# Main window
+# --------------------------------------------------------------------------
+
+class BaseStation(QMainWindow):
+    def __init__(self, host: str, port: int, poll_interval: float):
+        super().__init__()
+        self.setWindowTitle("Survey Rig Base Station")
+        self.resize(1500, 900)
+
+        self._stats = NetworkStats()
+        self._worker: PollWorker | None = None
         self._latest_frame: Frame | None = None
-        self._color_mode = "RGB"
+        self._cloud: pv.PolyData | None = None
+        self._actor = None
+        self._bounds_actor = None
+        self._origin_actor = None
         self._temp_range = None
-        self._status_expiry = None
-        self._last_stats_update = 0.0
+        self._point_size = 3
+        self._colormap = matplotlib.colormaps[THERMAL_COLORMAP]
+        # Persistent buffers handed to VTK -- see _on_frame for why these
+        # must be owned by the window rather than created per frame.
+        self._xyz_buffer: np.ndarray | None = None
+        self._color_buffer: np.ndarray | None = None
 
-        self._colormap = matplotlib.colormaps[THERMAL_COLORMAP_NAME]
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self._pcd = o3d.geometry.PointCloud()
-        self._geometry_added = False
-        self._material = rendering.MaterialRecord()
-        self._material.shader = "defaultUnlit"
-        self._material.point_size = 3.0
+        # -- 3D canvas ---------------------------------------------------
+        self.plotter = QtInteractor(central)
+        self.plotter.set_background(theme.VIEWPORT_BG, top=theme.VIEWPORT_BG_TOP)
+        # Corner orientation marker -- rotates with the camera so you always
+        # know which way X/Y/Z point.
+        self.plotter.add_axes(interactive=False)
+        root.addWidget(self.plotter.interactor, stretch=1)
 
-        self.window = gui.Application.instance.create_window(
-            "Survey Rig Base Station", 1400, 860)
-        self.window.set_on_layout(self._on_layout)
-        self.window.set_on_close(self._on_window_close)
-        self.window.set_on_tick_event(self._on_tick)
+        # -- side panel --------------------------------------------------
+        root.addWidget(self._build_panel(host, port, poll_interval))
 
-        em = self.window.theme.font_size
+        self._show_origin(True)
+        self._show_scale_grid(True)
 
-        self._scene = gui.SceneWidget()
-        self._scene.scene = rendering.Open3DScene(self.window.renderer)
-        self._scene.scene.set_background([0.08, 0.09, 0.10, 1.0])
-        self._scene.scene.scene.set_sun_light(
-            [-1, -1, -1], [1, 1, 1], 75000)
-        self._scene.scene.scene.enable_sun_light(True)
-        self._scene.scene.show_axes(True)
-        # ROTATE_CAMERA already gives left-drag orbit, right/middle-drag pan,
-        # and scroll-wheel zoom for free -- this is Open3D's default mouse
-        # scheme, nothing custom needed here.
-        self._scene.set_view_controls(gui.SceneWidget.Controls.ROTATE_CAMERA)
-        self.window.add_child(self._scene)
+        # Stats refresh on the GUI thread.
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._refresh_stats)
+        self._stats_timer.start(STATS_REFRESH_MS)
 
-        self._panel = gui.Vert(0, gui.Margins(0))
-        self.window.add_child(self._panel)
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(lambda: self.status_label.setText(""))
 
-        # -- header ---------------------------------------------------
-        header = gui.Vert(0.25 * em, gui.Margins(em, em, em, 0.5 * em))
-        title = gui.Label("Base Station")
-        title.text_color = ACCENT_COLOR
-        header.add_child(title)
-        self._link_label = gui.Label(f"polling {source_url}")
-        self._link_label.text_color = DIM_TEXT_COLOR
-        header.add_child(self._link_label)
-        self._panel.add_child(header)
-        self._panel.add_fixed(0.25 * em)
-        self._panel.add_child(self._make_divider())
+    # -- panel construction ---------------------------------------------
 
-        # -- rendering section ------------------------------------------
-        rendering_section = gui.CollapsableVert(
-            "Rendering", 0.4 * em, gui.Margins(em, 0.5 * em, em, 0.5 * em))
+    def _build_panel(self, host: str, port: int, poll_interval: float) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("SidePanel")
+        panel.setFixedWidth(330)
 
-        size_row = gui.Horiz(0.5 * em)
-        size_row.add_child(gui.Label("Point size"))
-        size_row.add_stretch()
-        self._point_size_value_label = gui.Label("3")
-        self._point_size_value_label.text_color = ACCENT_COLOR
-        size_row.add_child(self._point_size_value_label)
-        rendering_section.add_child(size_row)
+        scroll = QScrollArea(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        self._point_size_slider = gui.Slider(gui.Slider.INT)
-        self._point_size_slider.set_limits(1, 10)
-        self._point_size_slider.int_value = int(self._material.point_size)
-        self._point_size_slider.background_color = PANEL_ACCENT_BG
-        self._point_size_slider.set_on_value_changed(self._on_point_size_changed)
-        rendering_section.add_child(self._point_size_slider)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
 
-        rendering_section.add_fixed(0.5 * em)
-        rendering_section.add_child(gui.Label("Color overlay"))
-        self._color_combo = gui.Combobox()
-        self._color_combo.add_item("RGB")
-        self._color_combo.add_item("Thermal")
-        self._color_combo.selected_index = 0
-        self._color_combo.background_color = PANEL_ACCENT_BG
-        self._color_combo.set_on_selection_changed(self._on_color_mode_changed)
-        rendering_section.add_child(self._color_combo)
+        title = QLabel("Base Station")
+        title.setObjectName("TitleLabel")
+        layout.addWidget(title)
+        subtitle = QLabel("Live rover point cloud")
+        subtitle.setObjectName("SubtitleLabel")
+        layout.addWidget(subtitle)
+        layout.addSpacing(6)
 
-        self._temp_range_label = gui.Label("Temp range: n/a (RGB mode)")
-        self._temp_range_label.text_color = DIM_TEXT_COLOR
-        rendering_section.add_child(self._temp_range_label)
+        # -- connection ---------------------------------------------------
+        layout.addWidget(make_section_label("Connection"))
 
-        rendering_section.add_fixed(0.5 * em)
-        rendering_section.add_child(gui.Label("View"))
-        view_row = gui.Horiz(em)
-        self._axes_checkbox = gui.Checkbox("Axes")
-        self._axes_checkbox.checked = True
-        self._axes_checkbox.set_on_checked(self._on_axes_toggled)
-        view_row.add_child(self._axes_checkbox)
-        self._grid_checkbox = gui.Checkbox("Grid")
-        self._grid_checkbox.checked = False
-        self._grid_checkbox.set_on_checked(self._on_grid_toggled)
-        view_row.add_child(self._grid_checkbox)
-        rendering_section.add_child(view_row)
+        self.host_edit = QLineEdit(host)
+        self.host_edit.setPlaceholderText("rover IP, e.g. 192.168.1.50")
+        self.host_edit.setToolTip(
+            "IP or hostname of the machine serving /latest.bin.\n"
+            "Works with any sender on the network -- WSL, a Pi on the rig, etc.")
+        layout.addWidget(self._labeled("Rover host", self.host_edit))
 
-        self._reset_view_button = gui.Button("Reset View")
-        self._reset_view_button.background_color = PANEL_ACCENT_BG
-        self._reset_view_button.vertical_padding_em = 0.3
-        self._reset_view_button.set_on_clicked(self._on_reset_view_clicked)
-        rendering_section.add_child(self._reset_view_button)
+        port_row = QWidget()
+        port_layout = QHBoxLayout(port_row)
+        port_layout.setContentsMargins(0, 0, 0, 0)
+        port_layout.setSpacing(8)
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(port)
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(0.02, 5.0)
+        self.interval_spin.setSingleStep(0.05)
+        self.interval_spin.setDecimals(2)
+        self.interval_spin.setSuffix(" s")
+        self.interval_spin.setValue(poll_interval)
+        self.interval_spin.setToolTip("Minimum time between requests")
+        port_layout.addWidget(self._labeled("Port", self.port_spin))
+        port_layout.addWidget(self._labeled("Interval", self.interval_spin))
+        layout.addWidget(port_row)
 
-        self._panel.add_child(rendering_section)
-        self._panel.add_child(self._make_divider())
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setObjectName("PrimaryButton")
+        self.connect_button.clicked.connect(self._toggle_connection)
+        layout.addWidget(self.connect_button)
 
-        # -- capture section ------------------------------------------
-        capture_section = gui.CollapsableVert(
-            "Capture", 0.4 * em, gui.Margins(em, 0.5 * em, em, 0.5 * em))
-        self._save_button = gui.Button("Save PCD")
-        self._save_button.background_color = SAVE_COLOR
-        self._save_button.vertical_padding_em = 0.4
-        self._save_button.set_on_clicked(self._on_save_clicked)
-        capture_section.add_child(self._save_button)
+        self.connection_label = QLabel("Not connected")
+        self.connection_label.setObjectName("StatusLabel")
+        self.connection_label.setWordWrap(True)
+        layout.addWidget(self.connection_label)
 
-        self._status_label = gui.Label("")
-        self._status_label.text_color = DIM_TEXT_COLOR
-        capture_section.add_child(self._status_label)
+        layout.addWidget(make_divider())
 
-        self._panel.add_child(capture_section)
-        self._panel.add_child(self._make_divider())
+        # -- display ------------------------------------------------------
+        layout.addWidget(make_section_label("Display"))
 
-        # -- live stats section ------------------------------------------
-        stats_section = gui.CollapsableVert(
-            "Live Stats", 0.4 * em, gui.Margins(em, 0.5 * em, em, 0.5 * em))
-        self._rate_label = self._add_stat_row(stats_section, "Data rate")
-        self._points_label = self._add_stat_row(stats_section, "Points/sec")
-        self._fetch_label = self._add_stat_row(stats_section, "Fetch time")
-        self._frames_label = self._add_stat_row(stats_section, "Frames OK")
-        self._dropped_label = self._add_stat_row(stats_section, "Frames dropped")
-        self._panel.add_child(stats_section)
+        size_row = QWidget()
+        size_layout = QHBoxLayout(size_row)
+        size_layout.setContentsMargins(0, 0, 0, 0)
+        size_label = QLabel("Point size")
+        size_label.setObjectName("StatCaption")
+        self.size_value_label = QLabel("3")
+        self.size_value_label.setObjectName("StatValue")
+        size_layout.addWidget(size_label)
+        size_layout.addStretch()
+        size_layout.addWidget(self.size_value_label)
+        layout.addWidget(size_row)
 
-        self._panel.add_stretch()
+        self.size_slider = QSlider(Qt.Horizontal)
+        self.size_slider.setRange(1, 12)
+        self.size_slider.setValue(self._point_size)
+        self.size_slider.valueChanged.connect(self._on_point_size_changed)
+        layout.addWidget(self.size_slider)
 
-    def _make_divider(self) -> gui.Widget:
-        line = gui.Horiz()
-        line.preferred_height = 1
-        line.background_color = gui.Color(0.3, 0.3, 0.3)
-        return line
+        self.color_combo = QComboBox()
+        self.color_combo.addItems(["RGB (camera)", "Thermal"])
+        self.color_combo.currentIndexChanged.connect(self._on_color_mode_changed)
+        layout.addWidget(self._labeled("Color overlay", self.color_combo))
 
-    def _add_stat_row(self, parent, caption: str) -> gui.Label:
-        row = gui.Horiz(0.5 * self.window.theme.font_size)
-        cap = gui.Label(caption)
-        cap.text_color = DIM_TEXT_COLOR
-        row.add_child(cap)
-        row.add_stretch()
-        value = gui.Label("-")
-        row.add_child(value)
-        parent.add_child(row)
-        return value
+        self.temp_label = QLabel("Temp range: n/a")
+        self.temp_label.setObjectName("StatusLabel")
+        layout.addWidget(self.temp_label)
 
-    # -- layout / lifecycle -------------------------------------------------
+        layout.addWidget(make_divider())
 
-    def _on_layout(self, layout_context):
-        r = self.window.content_rect
-        panel_width = min(20 * layout_context.theme.font_size, 0.4 * r.width)
-        self._scene.frame = gui.Rect(r.x, r.y, r.width - panel_width, r.height)
-        self._panel.frame = gui.Rect(r.get_right() - panel_width, r.y,
-                                      panel_width, r.height)
+        # -- view ---------------------------------------------------------
+        layout.addWidget(make_section_label("View"))
 
-    def _on_window_close(self):
-        self._on_close_cb()
-        return True
+        self.axes_check = QCheckBox("Orientation axes")
+        self.axes_check.setChecked(True)
+        self.axes_check.toggled.connect(self._on_axes_toggled)
+        layout.addWidget(self.axes_check)
 
-    # -- per-frame tick -------------------------------------------------
+        self.origin_check = QCheckBox("Origin marker")
+        self.origin_check.setChecked(True)
+        self.origin_check.toggled.connect(self._show_origin)
+        layout.addWidget(self.origin_check)
 
-    def _on_tick(self):
-        # Only tell Open3D the 3D scene needs a redraw when a new point
-        # cloud actually arrived. This return value isn't just a framerate
-        # knob: Open3D appears to permanently switch the renderer into a
-        # continuous (vsync-locked, high-CPU) mode after enough cumulative
-        # True returns, even if they're spread out over time and the app is
-        # otherwise idle. So label/stat text is updated on every tick (cheap,
-        # and repaints fine on its own) without ever counting toward the
-        # scene's "needs redraw" signal.
-        got_new_frame = False
-        try:
-            while True:
-                self._latest_frame = self._frame_queue.get_nowait()
-                got_new_frame = True
-        except queue.Empty:
-            pass
+        self.scale_check = QCheckBox("Scale grid (metres)")
+        self.scale_check.setChecked(True)
+        self.scale_check.setToolTip(
+            "Graduated bounding box with tick labels in metres.\n"
+            "Ticks re-scale automatically as you zoom.")
+        self.scale_check.toggled.connect(self._show_scale_grid)
+        layout.addWidget(self.scale_check)
 
-        if got_new_frame and self._latest_frame is not None:
-            self._show_frame(self._latest_frame, reset_camera=not self._geometry_added)
+        view_buttons = QWidget()
+        vb_layout = QHBoxLayout(view_buttons)
+        vb_layout.setContentsMargins(0, 0, 0, 0)
+        vb_layout.setSpacing(8)
+        reset_button = QPushButton("Reset view")
+        reset_button.clicked.connect(self._reset_view)
+        top_button = QPushButton("Top-down")
+        top_button.clicked.connect(self._top_view)
+        vb_layout.addWidget(reset_button)
+        vb_layout.addWidget(top_button)
+        layout.addWidget(view_buttons)
 
-        now = time.time()
-        if now - self._last_stats_update >= STATS_REFRESH_SECONDS:
-            self._last_stats_update = now
-            self._update_stats_labels()
+        layout.addWidget(make_divider())
 
-        if self._status_expiry is not None and now > self._status_expiry:
-            self._status_label.text = ""
-            self._status_expiry = None
+        # -- capture ------------------------------------------------------
+        layout.addWidget(make_section_label("Capture"))
 
-        return got_new_frame
+        self.save_button = QPushButton("Save point cloud (.pcd)")
+        self.save_button.setObjectName("SuccessButton")
+        self.save_button.clicked.connect(self._save_pcd)
+        layout.addWidget(self.save_button)
 
-    # -- geometry / color -------------------------------------------------
+        screenshot_button = QPushButton("Save screenshot (.png)")
+        screenshot_button.clicked.connect(self._save_screenshot)
+        layout.addWidget(screenshot_button)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("StatusLabel")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        layout.addWidget(make_divider())
+
+        # -- stats --------------------------------------------------------
+        layout.addWidget(make_section_label("Live stats"))
+        self.stat_rate = StatRow("Data rate")
+        self.stat_points_sec = StatRow("Points / sec")
+        self.stat_count = StatRow("Points in frame")
+        self.stat_fetch = StatRow("Fetch time")
+        self.stat_ok = StatRow("Frames OK")
+        self.stat_failed = StatRow("Frames failed")
+        for row in (self.stat_rate, self.stat_points_sec, self.stat_count,
+                    self.stat_fetch, self.stat_ok, self.stat_failed):
+            layout.addWidget(row)
+
+        layout.addStretch()
+
+        scroll.setWidget(inner)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.addWidget(scroll)
+        return panel
+
+    @staticmethod
+    def _labeled(caption: str, widget: QWidget) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        label = QLabel(caption)
+        label.setObjectName("StatCaption")
+        layout.addWidget(label)
+        layout.addWidget(widget)
+        return container
+
+    # -- connection -----------------------------------------------------
+
+    def _toggle_connection(self) -> None:
+        if self._worker is not None:
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self) -> None:
+        host = self.host_edit.text().strip()
+        if not host:
+            self.connection_label.setText("Enter the rover's IP address first.")
+            return
+
+        url = f"http://{host}:{self.port_spin.value()}/latest.bin"
+        self._stats.reset()
+
+        self._worker = PollWorker(url, self.interval_spin.value(), self._stats)
+        self._worker.frame_ready.connect(self._on_frame)
+        self._worker.state_changed.connect(self._on_state_changed)
+        self._worker.start()
+
+        self.connect_button.setText("Disconnect")
+        self.connect_button.setObjectName("")
+        self.connect_button.setStyleSheet("")
+        self.connection_label.setText(f"Polling {url}")
+        for widget in (self.host_edit, self.port_spin, self.interval_spin):
+            widget.setEnabled(False)
+        self._restyle(self.connect_button)
+
+    def _disconnect(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker.wait(3000)
+            self._worker = None
+        self.connect_button.setText("Connect")
+        self.connect_button.setObjectName("PrimaryButton")
+        self.connection_label.setText("Not connected")
+        for widget in (self.host_edit, self.port_spin, self.interval_spin):
+            widget.setEnabled(True)
+        self._restyle(self.connect_button)
+
+    def _restyle(self, widget: QWidget) -> None:
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _on_state_changed(self, state: str, detail: str) -> None:
+        if state == "live":
+            self.connection_label.setText(f"● Live — {detail}")
+        elif state == "waiting":
+            self.connection_label.setText(f"○ {detail}")
+        else:
+            self.connection_label.setText(f"● {detail}")
+
+    # -- rendering -------------------------------------------------------
+
+    def _on_frame(self, frame: Frame) -> None:
+        self._latest_frame = frame
+        if frame.num_points == 0:
+            return
+
+        n = frame.num_points
+        colors = self._compute_colors(frame)
+
+        # VTK wraps numpy arrays by reference rather than copying them, so
+        # anything handed to it must outlive the render. These buffers are
+        # owned by the window and written in place; passing short-lived
+        # locals here causes VTK to read freed memory and crash the process.
+        rebuild = self._cloud is None or self._xyz_buffer is None \
+            or len(self._xyz_buffer) != n
+
+        if rebuild:
+            self._xyz_buffer = np.empty((n, 3), dtype=np.float32)
+            self._color_buffer = np.empty((n, 3), dtype=np.uint8)
+
+        np.copyto(self._xyz_buffer, frame.xyz)
+        np.copyto(self._color_buffer, colors)
+
+        first_frame = self._cloud is None
+        if rebuild:
+            if self._actor is not None:
+                self.plotter.remove_actor(self._actor, render=False)
+            self._cloud = pv.PolyData(self._xyz_buffer)
+            self._cloud["colors"] = self._color_buffer
+            self._actor = self.plotter.add_mesh(
+                self._cloud,
+                scalars="colors",
+                rgb=True,
+                point_size=self._point_size,
+                render_points_as_spheres=False,
+                lighting=False,
+                render=False,
+            )
+        else:
+            # Same point count: the buffers VTK already points at have just
+            # been overwritten, so only tell it they changed.
+            self._cloud.GetPoints().Modified()
+            scalars = self._cloud.GetPointData().GetScalars()
+            if scalars is not None:
+                scalars.Modified()
+            self._cloud.Modified()
+
+        if first_frame:
+            self.plotter.reset_camera()
+            if self.scale_check.isChecked():
+                self._show_scale_grid(True)
+
+        self.plotter.render()
 
     def _compute_colors(self, frame: Frame) -> np.ndarray:
-        if self._color_mode == "RGB":
+        if self.color_combo.currentIndex() == 0:
             self._temp_range = None
-            # Rover already sends 0-1 floats; clip defensively since this
-            # crosses a network boundary and isn't guaranteed in-range.
-            return np.clip(frame.rgb.astype(np.float64), 0.0, 1.0)
+            self.temp_label.setText("Temp range: n/a (RGB mode)")
+            rgb = np.clip(frame.rgb, 0.0, 1.0)
+            return (rgb * 255).astype(np.uint8)
 
         temp = frame.temp_c
         valid = ~np.isnan(temp)
+        colors = np.tile(np.array(INVALID_THERMAL_COLOR, dtype=np.uint8),
+                          (len(temp), 1))
+
         if not np.any(valid):
             self._temp_range = None
-            return np.tile(INVALID_THERMAL_COLOR, (len(temp), 1))
+            self.temp_label.setText("Temp range: no thermal data in frame")
+            return colors
 
         tmin = float(np.min(temp[valid]))
         tmax = float(np.max(temp[valid]))
         self._temp_range = (tmin, tmax)
-        span = max(tmax - tmin, 1e-6)
+        self.temp_label.setText(f"Temp range: {tmin:.1f} to {tmax:.1f} °C")
 
-        colors = np.tile(INVALID_THERMAL_COLOR, (len(temp), 1))
+        span = max(tmax - tmin, 1e-6)
         norm = np.clip((temp[valid] - tmin) / span, 0.0, 1.0)
-        colors[valid] = self._colormap(norm)[:, :3]
+        colors[valid] = (self._colormap(norm)[:, :3] * 255).astype(np.uint8)
         return colors
 
-    def _show_frame(self, frame: Frame, reset_camera: bool) -> None:
-        self._pcd.points = o3d.utility.Vector3dVector(frame.xyz.astype(np.float64))
-        self._pcd.colors = o3d.utility.Vector3dVector(self._compute_colors(frame))
+    # -- view controls ---------------------------------------------------
 
-        if self._geometry_added:
-            self._scene.scene.remove_geometry(GEOMETRY_NAME)
-        self._scene.scene.add_geometry(GEOMETRY_NAME, self._pcd, self._material)
-        self._geometry_added = True
+    def _on_point_size_changed(self, value: int) -> None:
+        self._point_size = value
+        self.size_value_label.setText(str(value))
+        if self._actor is not None:
+            self._actor.prop.point_size = value
+            self.plotter.render()
 
-        if reset_camera and frame.num_points > 0:
-            self._fit_camera_to_data()
-
-        if self._temp_range is not None:
-            tmin, tmax = self._temp_range
-            self._temp_range_label.text = f"Temp range: {tmin:.1f} - {tmax:.1f} C"
-        else:
-            self._temp_range_label.text = "Temp range: n/a (RGB mode)"
-
-    def _fit_camera_to_data(self) -> None:
-        if len(self._pcd.points) == 0:
-            return
-        bounds = self._pcd.get_axis_aligned_bounding_box()
-        self._scene.setup_camera(60, bounds, bounds.get_center())
-
-    # -- widget callbacks -------------------------------------------------
-
-    def _on_axes_toggled(self, checked: bool):
-        self._scene.scene.show_axes(checked)
-        self.window.post_redraw()
-
-    def _on_grid_toggled(self, checked: bool):
-        self._scene.scene.show_ground_plane(checked, rendering.Scene.GroundPlane.XY)
-        self.window.post_redraw()
-
-    def _on_reset_view_clicked(self):
-        self._fit_camera_to_data()
-        self.window.post_redraw()
-
-    def _on_point_size_changed(self, value):
-        self._material.point_size = float(value)
-        self._point_size_value_label.text = str(int(value))
-        if self._geometry_added:
-            self._scene.scene.modify_geometry_material(GEOMETRY_NAME, self._material)
-        self.window.post_redraw()
-
-    def _on_color_mode_changed(self, text, index):
-        self._color_mode = "RGB" if index == 0 else "Thermal"
+    def _on_color_mode_changed(self, _index: int) -> None:
         if self._latest_frame is not None:
-            self._show_frame(self._latest_frame, reset_camera=False)
-        self.window.post_redraw()
+            self._on_frame(self._latest_frame)
 
-    def _on_save_clicked(self):
-        if self._latest_frame is None:
-            self._set_status("No frame received yet -- nothing to save.")
-            return
-        os.makedirs(CAPTURES_DIR, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(CAPTURES_DIR, f"frame_{ts}.pcd")
-        ok = o3d.io.write_point_cloud(path, self._pcd)
-        if ok:
-            self._set_status(f"Saved {path} ({self._latest_frame.num_points} pts)")
+    def _on_axes_toggled(self, checked: bool) -> None:
+        if checked:
+            self.plotter.add_axes(interactive=False)
         else:
-            self._set_status("Save failed -- see console.")
+            self.plotter.hide_axes()
+        self.plotter.render()
+
+    def _show_origin(self, checked: bool) -> None:
+        if self._origin_actor is not None:
+            self.plotter.remove_actor(self._origin_actor, render=False)
+            self._origin_actor = None
+        if checked:
+            # A small triad drawn at world (0, 0, 0) so the rover's origin
+            # is always locatable in the scene.
+            self._origin_actor = self.plotter.add_axes_at_origin(
+                labels_off=True, line_width=3)
+        self.plotter.render()
+
+    def _show_scale_grid(self, checked: bool) -> None:
+        if self._bounds_actor is not None:
+            self.plotter.remove_bounds_axes()
+            self._bounds_actor = None
+        if checked:
+            # Graduated bounding box: VTK re-computes the tick spacing as the
+            # camera moves, so it doubles as a live scale reference.
+            self._bounds_actor = self.plotter.show_bounds(
+                grid="back",
+                location="outer",
+                ticks="both",
+                minor_ticks=True,
+                xtitle="X (m)",
+                ytitle="Y (m)",
+                ztitle="Z (m)",
+                color=theme.TEXT_DIM,
+                fmt="%.2f",
+            )
+        self.plotter.render()
+
+    def _reset_view(self) -> None:
+        self.plotter.reset_camera()
+        self.plotter.render()
+
+    def _top_view(self) -> None:
+        self.plotter.view_xy()
+        self.plotter.render()
+
+    # -- capture ---------------------------------------------------------
+
+    def _save_pcd(self) -> None:
+        if self._latest_frame is None or self._cloud is None:
+            self._set_status("No frame received yet - nothing to save.")
+            return
+        import open3d as o3d
+
+        os.makedirs(CAPTURES_DIR, exist_ok=True)
+        path = os.path.join(
+            CAPTURES_DIR, f"frame_{datetime.now():%Y%m%d_%H%M%S}.pcd")
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(
+            self._latest_frame.xyz.astype(np.float64))
+        pcd.colors = o3d.utility.Vector3dVector(
+            np.asarray(self._cloud["colors"], dtype=np.float64) / 255.0)
+
+        if o3d.io.write_point_cloud(path, pcd):
+            self._set_status(f"Saved {path} ({self._latest_frame.num_points:,} pts)")
+        else:
+            self._set_status("Save failed - check the captures/ folder permissions.")
+
+    def _save_screenshot(self) -> None:
+        os.makedirs(CAPTURES_DIR, exist_ok=True)
+        path = os.path.join(
+            CAPTURES_DIR, f"view_{datetime.now():%Y%m%d_%H%M%S}.png")
+        self.plotter.screenshot(path)
+        self._set_status(f"Saved {path}")
 
     def _set_status(self, text: str) -> None:
-        self._status_label.text = text
-        self._status_expiry = time.time() + STATUS_MESSAGE_SECONDS
+        self.status_label.setText(text)
+        self._status_timer.start(4000)
 
-    def _update_stats_labels(self) -> None:
+    # -- stats -----------------------------------------------------------
+
+    def _refresh_stats(self) -> None:
         s = self._stats.snapshot()
-        self._rate_label.text = f"{s['kbps']:.1f} KB/s"
-        self._points_label.text = f"{s['pts_per_sec']:,.0f}"
-        if s["fetch_seconds"] is not None:
-            self._fetch_label.text = f"{s['fetch_seconds'] * 1000:.0f} ms"
-        else:
-            self._fetch_label.text = "-"
-        self._frames_label.text = str(s["frames_received"])
-        self._dropped_label.text = str(s["frames_dropped"])
+        self.stat_rate.set(f"{s['kbps']:.1f} KB/s")
+        self.stat_points_sec.set(f"{s['pts_per_sec']:,.0f}")
+        self.stat_count.set(f"{s['point_count']:,}")
+        self.stat_fetch.set(
+            f"{s['fetch_seconds'] * 1000:.0f} ms" if s["fetch_seconds"] else "-")
+        self.stat_ok.set(str(s["frames_received"]))
+        self.stat_failed.set(str(s["frames_failed"]))
+
+    # -- lifecycle -------------------------------------------------------
+
+    def closeEvent(self, event):
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker.wait(3000)
+        self.plotter.close()
+        super().closeEvent(event)
+
+
+_fault_log = None
+
+
+def _enable_fault_log() -> None:
+    """Send native-crash tracebacks to crash.log (works without a console)."""
+    global _fault_log
+    try:
+        _fault_log = open("crash.log", "a", buffering=1, encoding="utf-8")
+        faulthandler.enable(file=_fault_log)
+    except Exception:
+        pass  # diagnostics are best-effort; never block startup
 
 
 def main():
+    import argparse
+
+    # A crash inside VTK/Qt native code produces no Python traceback. Log
+    # faults to a file rather than stderr: under pythonw.exe (the no-console
+    # launcher) sys.stderr is None, and faulthandler.enable() would itself
+    # raise and kill the app before the window ever appears.
+    _enable_fault_log()
+
     parser = argparse.ArgumentParser(description="Survey rig base station")
-    parser.add_argument("--rover-host", required=True,
-                         help="IP or hostname of the rover's HTTP point-cloud server")
-    parser.add_argument("--rover-port", type=int, default=8080,
-                         help="port of the rover's HTTP point-cloud server")
-    parser.add_argument("--poll-interval", type=float, default=0.1,
-                         help="minimum seconds between GET /latest.bin requests")
+    parser.add_argument("--rover-host", default="",
+                         help="rover IP to pre-fill (editable in the GUI)")
+    parser.add_argument("--rover-port", type=int, default=8080)
+    parser.add_argument("--poll-interval", type=float, default=0.2)
+    parser.add_argument("--connect", action="store_true",
+                         help="connect immediately on startup")
     args = parser.parse_args()
 
-    source_url = f"http://{args.rover_host}:{args.rover_port}/latest.bin"
+    app = QApplication(sys.argv)
+    app.setStyleSheet(theme.STYLESHEET)
 
-    frame_queue: queue.Queue = queue.Queue(maxsize=2)
-    stats = NetworkStats()
-    stop_event = threading.Event()
+    window = BaseStation(args.rover_host, args.rover_port, args.poll_interval)
+    window.showMaximized()
+    if args.connect and args.rover_host:
+        window._connect()
 
-    poller = threading.Thread(
-        target=poller_thread_main,
-        args=(source_url, frame_queue, stats, stop_event, args.poll_interval),
-        daemon=True,
-    )
-    poller.start()
-
-    def shutdown():
-        stop_event.set()
-
-    gui.Application.instance.initialize()
-    app = BaseStationApp(frame_queue, stats, source_url, shutdown)
-    print(f"Polling point cloud frames from {source_url}")
-    gui.Application.instance.run()
-
-    stop_event.set()
-    poller.join(timeout=1.0)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

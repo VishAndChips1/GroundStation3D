@@ -7,11 +7,5 @@ if not exist ".venv\Scripts\pythonw.exe" (
     exit /b 1
 )
 
-set /p ROVER_HOST=Rover IP address (e.g. 192.168.1.50):
-if "%ROVER_HOST%"=="" (
-    echo No rover IP entered, exiting.
-    pause
-    exit /b 1
-)
-
-start "" ".venv\Scripts\pythonw.exe" main.py --rover-host %ROVER_HOST%
+rem The rover IP is entered in the app window itself, so no prompt here.
+start "" ".venv\Scripts\pythonw.exe" main.py
