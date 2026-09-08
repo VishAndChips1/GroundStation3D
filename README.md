@@ -13,6 +13,9 @@ Built on Qt (PySide6) + PyVista/VTK.
 - **Any sender, any network** — the rover IP/port are entered in the app
   itself, so it works with a rig on WiFi, a WSL instance, or localhost
   without touching the command line
+- **Network discovery** — Scan for senders probes this machine, any running
+  WSL distro, and the local subnets, listing every host actually serving
+  point clouds with its point count
 - **Colour overlays** — camera RGB, or thermal colour-mapped (`inferno`)
   and auto-scaled to each frame's min/max, with points lacking a thermal
   reading drawn grey
@@ -21,12 +24,18 @@ Built on Qt (PySide6) + PyVista/VTK.
   metre tick labels rescale as you zoom
 - **Camera** — left-drag orbit, middle-drag pan, scroll/right-drag zoom,
   plus Reset view and Top-down buttons
-- **Capture** — save the current frame as a timestamped `.pcd`, or save a
-  PNG of the viewport
+- **Background colour picker** — pick any viewport colour; the vignette
+  rebuilds around it, or Reset returns to the default
+- **Capture** — Save point cloud / Save screenshot open a native save
+  dialog so you choose the file name and location
+- **Recording** — save every incoming frame automatically on an interval,
+  for a set duration, to a folder you choose
 - **Live stats** — data rate, points/sec, points in frame, HTTP fetch time,
   frames OK/failed
-- **Clear connection feedback** — connection refused / timed out / bad
-  frame are reported in plain language instead of failing silently
+- **Clear connection feedback** — a status pill (grey/amber/green/red) plus
+  plain-language errors for connection refused, timeout, or a bad frame
+- **Custom dark UI** — a slim custom title bar, card-grouped sections,
+  monoline icons, and one consistent spacing/radius/type scale throughout
 
 ## Requirements
 
@@ -109,7 +118,7 @@ python main.py --rover-host 127.0.0.1 --connect
 
 All parsing lives in `protocol.py`, isolated from the GUI. The rover serves:
 
-```
+```text
 GET http://<rover-host>:<port>/latest.bin
 
 Binary body (little-endian):
@@ -134,10 +143,12 @@ frame and a correspondingly lower practical poll rate over WiFi.
 
 | File | Purpose |
 | --- | --- |
-| `main.py` | Qt window, 3D view, polling thread, stats |
+| `main.py` | Qt window, 3D view, polling thread, recording, stats |
 | `protocol.py` | Wire format — the only file to touch if it changes |
 | `discovery.py` | Network scan that finds senders on the local subnets |
-| `theme.py` | Dark theme stylesheet |
+| `theme.py` | Design tokens and stylesheet (spacing, radius, palette, type) |
+| `widgets.py` | Reusable UI pieces: cards, section headers, status pill, title bar |
+| `icons.py` | Monoline icon set (inline SVG) and the app icon |
 | `tools/mock_rover_server.py` | Synthetic sender for testing without hardware |
 
 ## Non-goals

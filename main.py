@@ -6,6 +6,7 @@ and renders the latest frame live. Built on Qt (PySide6) + PyVista/VTK.
 See protocol.py for the wire format and README.md for usage.
 """
 
+import ctypes
 import faulthandler
 import json
 import os
@@ -20,29 +21,41 @@ from datetime import datetime
 import matplotlib
 import numpy as np
 import pyvista as pv
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSlider,
-    QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
+    QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 from pyvistaqt import QtInteractor
 
 import discovery
+import icons
 import theme
+import widgets
 from protocol import Frame, MalformedFrameError, parse_frame
 
 RECENT_HOSTS_FILE = "recent_hosts.json"
 MAX_RECENT_HOSTS = 8
 
 CAPTURES_DIR = "captures"
+PANEL_MIN_WIDTH = 340
+PANEL_MAX_WIDTH = 460
 # Generous by default: over real WiFi a full-resolution frame can be several
 # MB, and a tight timeout would fail every request on a marginal link.
 DEFAULT_FETCH_TIMEOUT = 10.0
 INVALID_THERMAL_COLOR = (128, 128, 128)  # gray for points with no thermal reading
 THERMAL_COLORMAP = "inferno"
 STATS_REFRESH_MS = 250
+
+# Win32 hit-test codes, used to keep native resize/snap on a frameless window.
+_WM_NCHITTEST = 0x0084
+_HT = {
+    "client": 1, "caption": 2, "left": 10, "right": 11, "top": 12,
+    "topleft": 13, "topright": 14, "bottom": 15, "bottomleft": 16,
+    "bottomright": 17,
+}
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +127,7 @@ class PollWorker(QThread):
     """
 
     frame_ready = Signal(object)
-    state_changed = Signal(str, str)  # state ("live"/"waiting"/"error"), detail
+    state_changed = Signal(str, str)  # state ("live"/"connecting"/"error"), detail
 
     def __init__(self, url: str, poll_interval: float, stats: NetworkStats,
                  timeout: float = DEFAULT_FETCH_TIMEOUT):
@@ -137,7 +150,7 @@ class PollWorker(QThread):
 
     def run(self) -> None:
         frame_id = 0
-        self._emit_state("waiting", "connecting...")
+        self._emit_state("connecting", "Connecting...")
 
         while not self._stop_event.is_set():
             start = time.time()
@@ -162,13 +175,13 @@ class PollWorker(QThread):
                 frame = parse_frame(data, frame_id, recv_time, fetch_seconds)
             except MalformedFrameError as exc:
                 self._stats.record_failure()
-                self._emit_state("error", f"bad frame: {exc}")
+                self._emit_state("error", f"Bad frame: {exc}")
                 self._stop_event.wait(self._poll_interval)
                 continue
 
             frame_id += 1
             self._stats.record_frame(len(data), frame.num_points, fetch_seconds)
-            self._emit_state("live", f"{frame.num_points:,} points")
+            self._emit_state("live", f"Live - {frame.num_points:,} points")
             self.frame_ready.emit(frame)
 
             elapsed = time.time() - start
@@ -180,11 +193,11 @@ class PollWorker(QThread):
         reason = getattr(exc, "reason", exc)
         text = str(reason)
         if "refused" in text.lower():
-            return "connection refused - is the rover server running?"
+            return "Connection refused - is the rover server running?"
         if "timed out" in text.lower() or isinstance(exc, TimeoutError):
-            return "timed out - check the IP and that you're on the same network"
+            return "Timed out - check the IP and that you're on the same network"
         if "unreachable" in text.lower():
-            return "host unreachable - check the IP"
+            return "Host unreachable - check the IP"
         return text[:80]
 
 
@@ -214,41 +227,53 @@ class DiscoveryWorker(QThread):
 
 
 # --------------------------------------------------------------------------
-# GUI helpers
+# Recording
 # --------------------------------------------------------------------------
 
-def make_divider() -> QFrame:
-    line = QFrame()
-    line.setObjectName("Divider")
-    line.setFrameShape(QFrame.HLine)
-    line.setFixedHeight(1)
-    return line
+class FrameRecorder:
+    """Saves incoming frames to disk on an interval, for a fixed duration."""
 
+    def __init__(self):
+        self.active = False
+        self.folder = ""
+        self.interval = 1.0
+        self.duration = 30.0
+        self.saved = 0
+        self.failed = 0
+        self._started_at = 0.0
+        self._last_saved_at = 0.0
 
-def make_section_label(text: str) -> QLabel:
-    label = QLabel(text.upper())
-    label.setObjectName("SectionLabel")
-    return label
+    def start(self, folder: str, interval: float, duration: float) -> None:
+        self.folder = folder
+        self.interval = interval
+        self.duration = duration
+        self.saved = 0
+        self.failed = 0
+        self._started_at = time.time()
+        # Zero means "save the first frame that arrives".
+        self._last_saved_at = 0.0
+        self.active = True
 
+    def stop(self) -> None:
+        self.active = False
 
-class StatRow(QWidget):
-    """A caption on the left, a value on the right."""
+    def elapsed(self) -> float:
+        return time.time() - self._started_at if self.active else 0.0
 
-    def __init__(self, caption: str):
-        super().__init__()
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        cap = QLabel(caption)
-        cap.setObjectName("StatCaption")
-        self.value = QLabel("-")
-        self.value.setObjectName("StatValue")
-        self.value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(cap)
-        layout.addStretch()
-        layout.addWidget(self.value)
+    def expired(self) -> bool:
+        return self.active and self.elapsed() >= self.duration
 
-    def set(self, text: str) -> None:
-        self.value.setText(text)
+    def should_save(self) -> bool:
+        if not self.active:
+            return False
+        return (time.time() - self._last_saved_at) >= self.interval
+
+    def note_saved(self, ok: bool) -> None:
+        self._last_saved_at = time.time()
+        if ok:
+            self.saved += 1
+        else:
+            self.failed += 1
 
 
 # --------------------------------------------------------------------------
@@ -256,14 +281,24 @@ class StatRow(QWidget):
 # --------------------------------------------------------------------------
 
 class BaseStation(QMainWindow):
+    RESIZE_MARGIN = 6
+
     def __init__(self, host: str, port: int, poll_interval: float,
                  timeout: float = DEFAULT_FETCH_TIMEOUT):
         super().__init__()
         self.setWindowTitle("Survey Rig Base Station")
-        self.resize(1500, 900)
+        self.setWindowIcon(icons.app_icon(theme.ACCENT))
+        self.resize(1500, 920)
+        self.setMinimumSize(900, 600)
         self._timeout = timeout
 
+        # Frameless so the title bar can match the palette. On Windows the
+        # native hit-test below keeps real resizing, snapping and
+        # double-click-to-maximise working.
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+
         self._stats = NetworkStats()
+        self._recorder = FrameRecorder()
         self._worker: PollWorker | None = None
         self._scanner: DiscoveryWorker | None = None
         self._scan_hits = 0
@@ -274,6 +309,9 @@ class BaseStation(QMainWindow):
         self._origin_actor = None
         self._temp_range = None
         self._point_size = 3
+        self._bg_base = theme.VIEWPORT_BG_CENTER
+        self._bg_pixels: np.ndarray | None = None
+        self._bg_texture = None
         self._colormap = matplotlib.colormaps[THERMAL_COLORMAP]
         # Persistent buffers handed to VTK -- see _on_frame for why these
         # must be owned by the window rather than created per frame.
@@ -282,16 +320,27 @@ class BaseStation(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        shell = QVBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        # -- title bar ---------------------------------------------------
+        self.title_bar = widgets.TitleBar("Survey Rig Base Station")
+        self.title_bar.minimize_requested.connect(self.showMinimized)
+        self.title_bar.maximize_requested.connect(self._toggle_maximized)
+        self.title_bar.close_requested.connect(self.close)
+        shell.addWidget(self.title_bar)
+
+        body = QWidget()
+        shell.addWidget(body, 1)
+        root = QHBoxLayout(body)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
         # -- 3D canvas ---------------------------------------------------
-        self.plotter = QtInteractor(central)
-        self.plotter.set_background(theme.VIEWPORT_BG, top=theme.VIEWPORT_BG_TOP)
-        # Corner orientation marker -- rotates with the camera so you always
-        # know which way X/Y/Z point.
-        self.plotter.add_axes(interactive=False)
+        self.plotter = QtInteractor(body)
+        self._apply_viewport_background()
+        self._add_orientation_axes()
         root.addWidget(self.plotter.interactor, stretch=1)
 
         # -- side panel --------------------------------------------------
@@ -306,21 +355,88 @@ class BaseStation(QMainWindow):
         self._show_origin(True)
         self._show_scale_grid(True)
 
-        # Stats refresh on the GUI thread.
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._refresh_stats)
         self._stats_timer.start(STATS_REFRESH_MS)
 
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
-        self._status_timer.timeout.connect(lambda: self.status_label.setText(""))
+        self._status_timer.timeout.connect(lambda: self.capture_status.setText(""))
+
+    # -- frameless window plumbing ---------------------------------------
+
+    def _toggle_maximized(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def changeEvent(self, event):
+        if event.type() == event.Type.WindowStateChange:
+            self.title_bar.set_maximized(self.isMaximized())
+        super().changeEvent(event)
+
+    def nativeEvent(self, event_type, message):
+        """Let Windows resize/snap a frameless window.
+
+        Reporting the edges as frame hits (and the title bar as caption)
+        hands drag-move, edge-resize, Aero Snap and double-click-maximise
+        back to the OS, which behaves far better than reimplementing them.
+        """
+        if os.name != "nt" or event_type != b"windows_generic_MSG":
+            return super().nativeEvent(event_type, message)
+        try:
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+        except (TypeError, ValueError):
+            return super().nativeEvent(event_type, message)
+
+        if msg.message != _WM_NCHITTEST or self.isMaximized():
+            return super().nativeEvent(event_type, message)
+
+        # lParam packs a signed screen-space x/y pair, in physical pixels;
+        # Qt geometry is in logical pixels, so scale before mapping.
+        x = ctypes.c_short(msg.lParam & 0xFFFF).value
+        y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+        ratio = self.devicePixelRatioF() or 1.0
+        pos = self.mapFromGlobal(QPoint(round(x / ratio), round(y / ratio)))
+
+        margin = self.RESIZE_MARGIN
+        w, h = self.width(), self.height()
+        left = pos.x() < margin
+        right = pos.x() > w - margin
+        top = pos.y() < margin
+        bottom = pos.y() > h - margin
+
+        if top and left:
+            return True, _HT["topleft"]
+        if top and right:
+            return True, _HT["topright"]
+        if bottom and left:
+            return True, _HT["bottomleft"]
+        if bottom and right:
+            return True, _HT["bottomright"]
+        if left:
+            return True, _HT["left"]
+        if right:
+            return True, _HT["right"]
+        if top:
+            return True, _HT["top"]
+        if bottom:
+            return True, _HT["bottom"]
+
+        # Title bar drags the window, except over its buttons.
+        if pos.y() < self.title_bar.height():
+            child = self.childAt(pos)
+            if not isinstance(child, QPushButton):
+                return True, _HT["caption"]
+
+        return super().nativeEvent(event_type, message)
 
     # -- panel construction ---------------------------------------------
 
     def _build_panel(self, host: str, port: int, poll_interval: float) -> QWidget:
         panel = QFrame()
         panel.setObjectName("SidePanel")
-        panel.setFixedWidth(330)
 
         scroll = QScrollArea(panel)
         scroll.setWidgetResizable(True)
@@ -328,8 +444,9 @@ class BaseStation(QMainWindow):
 
         inner = QWidget()
         layout = QVBoxLayout(inner)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(
+            theme.SPACE_4, theme.SPACE_4, theme.SPACE_4, theme.SPACE_4)
+        layout.setSpacing(theme.SPACE_3)
 
         title = QLabel("Base Station")
         title.setObjectName("TitleLabel")
@@ -337,10 +454,34 @@ class BaseStation(QMainWindow):
         subtitle = QLabel("Live rover point cloud")
         subtitle.setObjectName("SubtitleLabel")
         layout.addWidget(subtitle)
-        layout.addSpacing(6)
+        layout.addSpacing(theme.SPACE_1)
 
-        # -- connection ---------------------------------------------------
-        layout.addWidget(make_section_label("Connection"))
+        layout.addWidget(self._connection_card(host, port, poll_interval))
+        layout.addWidget(self._display_card())
+        layout.addWidget(self._view_card())
+        layout.addWidget(self._capture_card())
+        layout.addWidget(self._recording_card())
+        layout.addWidget(self._stats_card())
+        layout.addStretch()
+
+        scroll.setWidget(inner)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.addWidget(scroll)
+
+        # Size the panel from what its controls actually need. Hard-coding a
+        # width silently clips the widest card (and with horizontal scrolling
+        # off, that content becomes unreachable).
+        needed = inner.minimumSizeHint().width()
+        scrollbar = scroll.verticalScrollBar().sizeHint().width()
+        panel.setFixedWidth(
+            max(PANEL_MIN_WIDTH,
+                min(PANEL_MAX_WIDTH, needed + scrollbar + theme.SPACE_2)))
+        return panel
+
+    def _connection_card(self, host: str, port: int,
+                          poll_interval: float) -> widgets.Card:
+        card = widgets.Card("wifi", "Connection")
 
         self.host_combo = QComboBox()
         self.host_combo.setEditable(True)
@@ -354,24 +495,25 @@ class BaseStation(QMainWindow):
         self.host_combo.activated.connect(self._on_host_picked)
         if host:
             self.host_combo.setCurrentText(host)
-        layout.addWidget(self._labeled("Rover host", self.host_combo))
+        card.add(widgets.labeled_field("server", "Rover host", self.host_combo))
 
-        self.scan_button = QPushButton("Scan for senders")
+        self.scan_button = QPushButton("  Scan for senders")
+        self.scan_button.setIcon(icons.icon("search", theme.TEXT, 15))
         self.scan_button.setToolTip(
             "Probes this machine, any WSL distro, and the local subnets for\n"
             "servers actually answering /latest.bin.")
         self.scan_button.clicked.connect(self._toggle_scan)
-        layout.addWidget(self.scan_button)
+        card.add(self.scan_button)
 
         self.scan_label = QLabel("")
-        self.scan_label.setObjectName("StatusLabel")
+        self.scan_label.setObjectName("HintLabel")
         self.scan_label.setWordWrap(True)
-        layout.addWidget(self.scan_label)
+        self.scan_label.setVisible(False)
+        card.add(self.scan_label)
 
-        port_row = QWidget()
-        port_layout = QHBoxLayout(port_row)
-        port_layout.setContentsMargins(0, 0, 0, 0)
-        port_layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(theme.SPACE_3)
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(port)
@@ -382,66 +524,83 @@ class BaseStation(QMainWindow):
         self.interval_spin.setSuffix(" s")
         self.interval_spin.setValue(poll_interval)
         self.interval_spin.setToolTip("Minimum time between requests")
-        port_layout.addWidget(self._labeled("Port", self.port_spin))
-        port_layout.addWidget(self._labeled("Interval", self.interval_spin))
-        layout.addWidget(port_row)
+        row.addWidget(widgets.labeled_field("hash", "Port", self.port_spin))
+        row.addWidget(widgets.labeled_field("clock", "Interval", self.interval_spin))
+        card.add_layout(row)
 
         self.connect_button = QPushButton("Connect")
         self.connect_button.setObjectName("PrimaryButton")
         self.connect_button.clicked.connect(self._toggle_connection)
-        layout.addWidget(self.connect_button)
+        card.add(self.connect_button)
 
-        self.connection_label = QLabel("Not connected")
-        self.connection_label.setObjectName("StatusLabel")
-        self.connection_label.setWordWrap(True)
-        layout.addWidget(self.connection_label)
+        self.status_pill = widgets.StatusPill()
+        card.add(self.status_pill)
+        return card
 
-        layout.addWidget(make_divider())
-
-        # -- display ------------------------------------------------------
-        layout.addWidget(make_section_label("Display"))
+    def _display_card(self) -> widgets.Card:
+        card = widgets.Card("sliders", "Display")
 
         size_row = QWidget()
         size_layout = QHBoxLayout(size_row)
         size_layout.setContentsMargins(0, 0, 0, 0)
-        size_label = QLabel("Point size")
-        size_label.setObjectName("StatCaption")
+        size_layout.setSpacing(theme.SPACE_1 + 2)
+        glyph = QLabel()
+        glyph.setPixmap(icons.pixmap("dots", theme.TEXT_MUTED, 14))
+        glyph.setFixedSize(14, 14)
+        size_layout.addWidget(glyph)
+        caption = QLabel("Point size")
+        caption.setObjectName("FieldLabel")
+        size_layout.addWidget(caption)
+        size_layout.addStretch()
         self.size_value_label = QLabel("3")
         self.size_value_label.setObjectName("StatValue")
-        size_layout.addWidget(size_label)
-        size_layout.addStretch()
         size_layout.addWidget(self.size_value_label)
-        layout.addWidget(size_row)
+        card.add(size_row)
 
         self.size_slider = QSlider(Qt.Horizontal)
         self.size_slider.setRange(1, 12)
         self.size_slider.setValue(self._point_size)
         self.size_slider.valueChanged.connect(self._on_point_size_changed)
-        layout.addWidget(self.size_slider)
+        card.add(self.size_slider)
 
         self.color_combo = QComboBox()
         self.color_combo.addItems(["RGB (camera)", "Thermal"])
         self.color_combo.currentIndexChanged.connect(self._on_color_mode_changed)
-        layout.addWidget(self._labeled("Color overlay", self.color_combo))
+        card.add(widgets.labeled_field("layers", "Color overlay", self.color_combo))
 
         self.temp_label = QLabel("Temp range: n/a")
-        self.temp_label.setObjectName("StatusLabel")
-        layout.addWidget(self.temp_label)
+        self.temp_label.setObjectName("HintLabel")
+        self.temp_label.setWordWrap(True)
+        card.add(self.temp_label)
 
-        layout.addWidget(make_divider())
+        bg_row = QHBoxLayout()
+        bg_row.setContentsMargins(0, 0, 0, 0)
+        bg_row.setSpacing(theme.SPACE_2)
+        self.bg_button = QPushButton("  Background colour")
+        self.bg_button.setToolTip(
+            "Pick the viewport colour. The vignette is rebuilt around it.")
+        self.bg_button.clicked.connect(self._choose_background)
+        bg_row.addWidget(self.bg_button, 1)
+        reset_bg = QPushButton("Reset")
+        reset_bg.setToolTip("Back to the default dark viewport")
+        reset_bg.clicked.connect(self._reset_background)
+        bg_row.addWidget(reset_bg)
+        card.add_layout(bg_row)
+        self._update_bg_swatch()
+        return card
 
-        # -- view ---------------------------------------------------------
-        layout.addWidget(make_section_label("View"))
+    def _view_card(self) -> widgets.Card:
+        card = widgets.Card("eye", "View")
 
         self.axes_check = QCheckBox("Orientation axes")
         self.axes_check.setChecked(True)
         self.axes_check.toggled.connect(self._on_axes_toggled)
-        layout.addWidget(self.axes_check)
+        card.add(self.axes_check)
 
         self.origin_check = QCheckBox("Origin marker")
         self.origin_check.setChecked(True)
         self.origin_check.toggled.connect(self._show_origin)
-        layout.addWidget(self.origin_check)
+        card.add(self.origin_check)
 
         self.scale_check = QCheckBox("Scale grid (metres)")
         self.scale_check.setChecked(True)
@@ -449,72 +608,116 @@ class BaseStation(QMainWindow):
             "Graduated bounding box with tick labels in metres.\n"
             "Ticks re-scale automatically as you zoom.")
         self.scale_check.toggled.connect(self._show_scale_grid)
-        layout.addWidget(self.scale_check)
+        card.add(self.scale_check)
 
-        view_buttons = QWidget()
-        vb_layout = QHBoxLayout(view_buttons)
-        vb_layout.setContentsMargins(0, 0, 0, 0)
-        vb_layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(theme.SPACE_2)
         reset_button = QPushButton("Reset view")
         reset_button.clicked.connect(self._reset_view)
         top_button = QPushButton("Top-down")
         top_button.clicked.connect(self._top_view)
-        vb_layout.addWidget(reset_button)
-        vb_layout.addWidget(top_button)
-        layout.addWidget(view_buttons)
+        row.addWidget(reset_button)
+        row.addWidget(top_button)
+        card.add_layout(row)
+        return card
 
-        layout.addWidget(make_divider())
+    def _capture_card(self) -> widgets.Card:
+        card = widgets.Card("camera", "Capture")
 
-        # -- capture ------------------------------------------------------
-        layout.addWidget(make_section_label("Capture"))
+        self.save_cloud_button = QPushButton("  Save point cloud...")
+        self.save_cloud_button.setIcon(icons.icon("download", theme.TEXT, 15))
+        self.save_cloud_button.clicked.connect(self._save_pcd)
+        card.add(self.save_cloud_button)
 
-        self.save_button = QPushButton("Save point cloud (.pcd)")
-        self.save_button.setObjectName("SuccessButton")
-        self.save_button.clicked.connect(self._save_pcd)
-        layout.addWidget(self.save_button)
+        self.save_png_button = QPushButton("  Save screenshot...")
+        self.save_png_button.setIcon(icons.icon("image", theme.TEXT, 15))
+        self.save_png_button.clicked.connect(self._save_screenshot)
+        card.add(self.save_png_button)
 
-        screenshot_button = QPushButton("Save screenshot (.png)")
-        screenshot_button.clicked.connect(self._save_screenshot)
-        layout.addWidget(screenshot_button)
+        self.capture_status = QLabel("")
+        self.capture_status.setObjectName("HintLabel")
+        self.capture_status.setWordWrap(True)
+        card.add(self.capture_status)
+        return card
 
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("StatusLabel")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+    def _recording_card(self) -> widgets.Card:
+        card = widgets.Card("record", "Recording")
 
-        layout.addWidget(make_divider())
+        hint = QLabel("Saves every incoming frame on an interval, for a set "
+                       "length of time.")
+        hint.setObjectName("HintLabel")
+        hint.setWordWrap(True)
+        card.add(hint)
 
-        # -- stats --------------------------------------------------------
-        layout.addWidget(make_section_label("Live stats"))
-        self.stat_rate = StatRow("Data rate")
-        self.stat_points_sec = StatRow("Points / sec")
-        self.stat_count = StatRow("Points in frame")
-        self.stat_fetch = StatRow("Fetch time")
-        self.stat_ok = StatRow("Frames OK")
-        self.stat_failed = StatRow("Frames failed")
-        for row in (self.stat_rate, self.stat_points_sec, self.stat_count,
-                    self.stat_fetch, self.stat_ok, self.stat_failed):
-            layout.addWidget(row)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(theme.SPACE_3)
+        self.rec_interval_spin = QDoubleSpinBox()
+        self.rec_interval_spin.setRange(0.05, 60.0)
+        self.rec_interval_spin.setSingleStep(0.25)
+        self.rec_interval_spin.setDecimals(2)
+        self.rec_interval_spin.setSuffix(" s")
+        self.rec_interval_spin.setValue(1.0)
+        self.rec_interval_spin.setToolTip("Time between saved frames")
+        self.rec_duration_spin = QDoubleSpinBox()
+        self.rec_duration_spin.setRange(1.0, 86400.0)
+        self.rec_duration_spin.setSingleStep(10.0)
+        self.rec_duration_spin.setDecimals(0)
+        self.rec_duration_spin.setSuffix(" s")
+        self.rec_duration_spin.setValue(30)
+        self.rec_duration_spin.setToolTip("How long to keep recording")
+        row.addWidget(widgets.labeled_field("clock", "Every",
+                                             self.rec_interval_spin))
+        row.addWidget(widgets.labeled_field("clock", "For",
+                                             self.rec_duration_spin))
+        card.add_layout(row)
 
-        layout.addStretch()
+        self.rec_folder_button = QPushButton("  Choose folder...")
+        self.rec_folder_button.setIcon(icons.icon("folder", theme.TEXT, 15))
+        self.rec_folder_button.clicked.connect(self._choose_record_folder)
+        card.add(self.rec_folder_button)
 
-        scroll.setWidget(inner)
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.addWidget(scroll)
-        return panel
+        self.rec_folder_label = QLabel("No folder chosen")
+        self.rec_folder_label.setObjectName("HintLabel")
+        self.rec_folder_label.setWordWrap(True)
+        card.add(self.rec_folder_label)
 
-    @staticmethod
-    def _labeled(caption: str, widget: QWidget) -> QWidget:
-        container = QWidget()
-        layout = QVBoxLayout(container)
+        self.record_button = QPushButton("  Start recording")
+        self.record_button.setIcon(icons.icon("record", theme.TEXT, 15))
+        self.record_button.clicked.connect(self._toggle_recording)
+        card.add(self.record_button)
+
+        self.record_pill = widgets.StatusPill()
+        self.record_pill.set_state("idle", "Not recording")
+        card.add(self.record_pill)
+        return card
+
+    def _stats_card(self) -> widgets.Card:
+        card = widgets.Card("activity", "Live stats")
+        self.stat_rate = self._stat_row(card, "Data rate")
+        self.stat_points_sec = self._stat_row(card, "Points / sec")
+        self.stat_count = self._stat_row(card, "Points in frame")
+        self.stat_fetch = self._stat_row(card, "Fetch time")
+        self.stat_ok = self._stat_row(card, "Frames OK")
+        self.stat_failed = self._stat_row(card, "Frames failed")
+        return card
+
+    def _stat_row(self, card: widgets.Card, caption: str) -> QLabel:
+        row = QWidget()
+        layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        label = QLabel(caption)
-        label.setObjectName("StatCaption")
-        layout.addWidget(label)
-        layout.addWidget(widget)
-        return container
+        layout.setSpacing(theme.SPACE_2)
+        cap = QLabel(caption)
+        cap.setObjectName("StatCaption")
+        value = QLabel("-")
+        value.setObjectName("StatValue")
+        value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(cap)
+        layout.addStretch()
+        layout.addWidget(value)
+        card.add(row)
+        return value
 
     # -- discovery ------------------------------------------------------
 
@@ -526,17 +729,22 @@ class BaseStation(QMainWindow):
     def _toggle_scan(self) -> None:
         if self._scanner is not None:
             self._scanner.stop()
-            self.scan_label.setText("Scan cancelled.")
+            self._set_scan_hint("Scan cancelled.")
             self._finish_scan()
             return
 
         self._scan_hits = 0
         self._scanner = DiscoveryWorker(self.port_spin.value())
         self._scanner.found.connect(self._on_sender_found)
-        self._scanner.progress.connect(self.scan_label.setText)
+        self._scanner.progress.connect(self._set_scan_hint)
         self._scanner.done.connect(self._on_scan_done)
         self._scanner.start()
-        self.scan_button.setText("Stop scan")
+        self.scan_button.setText("  Stop scan")
+        self.scan_button.setIcon(icons.icon("stop", theme.TEXT, 15))
+
+    def _set_scan_hint(self, text: str) -> None:
+        self.scan_label.setText(text)
+        self.scan_label.setVisible(bool(text))
 
     def _on_sender_found(self, host: str, num_points: int) -> None:
         self._scan_hits += 1
@@ -553,11 +761,11 @@ class BaseStation(QMainWindow):
 
     def _on_scan_done(self, count: int) -> None:
         if count:
-            self.scan_label.setText(
+            self._set_scan_hint(
                 f"Found {count} sender{'s' if count != 1 else ''} - "
                 "pick one above, then Connect.")
         else:
-            self.scan_label.setText(
+            self._set_scan_hint(
                 f"No senders answering on port {self.port_spin.value()}. "
                 "Check the rover server is running and on this network.")
         self._finish_scan()
@@ -566,7 +774,8 @@ class BaseStation(QMainWindow):
         if self._scanner is not None:
             self._scanner.wait(2000)
             self._scanner = None
-        self.scan_button.setText("Scan for senders")
+        self.scan_button.setText("  Scan for senders")
+        self.scan_button.setIcon(icons.icon("search", theme.TEXT, 15))
 
     # -- recent hosts ----------------------------------------------------
 
@@ -604,8 +813,8 @@ class BaseStation(QMainWindow):
     def _connect(self) -> None:
         host = self.host_combo.currentText().strip()
         if not host:
-            self.connection_label.setText(
-                "Enter the rover's IP, or press Scan to find one.")
+            self.status_pill.set_state(
+                "error", "Enter the rover's IP, or press Scan to find one.")
             return
 
         url = f"http://{host}:{self.port_spin.value()}/latest.bin"
@@ -620,9 +829,9 @@ class BaseStation(QMainWindow):
 
         self.connect_button.setText("Disconnect")
         self.connect_button.setObjectName("")
-        self.connect_button.setStyleSheet("")
-        self.connection_label.setText(f"Polling {url}")
-        for widget in (self.host_combo, self.port_spin, self.interval_spin, self.scan_button):
+        self.status_pill.set_state("connecting", "Connecting...")
+        for widget in (self.host_combo, self.port_spin, self.interval_spin,
+                        self.scan_button):
             widget.setEnabled(False)
         self._restyle(self.connect_button)
 
@@ -631,10 +840,13 @@ class BaseStation(QMainWindow):
             self._worker.stop()
             self._worker.wait(3000)
             self._worker = None
+        if self._recorder.active:
+            self._stop_recording("Recording stopped - disconnected.")
         self.connect_button.setText("Connect")
         self.connect_button.setObjectName("PrimaryButton")
-        self.connection_label.setText("Not connected")
-        for widget in (self.host_combo, self.port_spin, self.interval_spin, self.scan_button):
+        self.status_pill.set_state("idle", "Not connected")
+        for widget in (self.host_combo, self.port_spin, self.interval_spin,
+                        self.scan_button):
             widget.setEnabled(True)
         self._restyle(self.connect_button)
 
@@ -643,14 +855,71 @@ class BaseStation(QMainWindow):
         widget.style().polish(widget)
 
     def _on_state_changed(self, state: str, detail: str) -> None:
-        if state == "live":
-            self.connection_label.setText(f"● Live — {detail}")
-        elif state == "waiting":
-            self.connection_label.setText(f"○ {detail}")
-        else:
-            self.connection_label.setText(f"● {detail}")
+        self.status_pill.set_state(state, detail)
 
     # -- rendering -------------------------------------------------------
+
+    def _choose_background(self) -> None:
+        current = QColor.fromRgbF(*self._bg_base)
+        chosen = QColorDialog.getColor(
+            current, self, "Viewport background colour")
+        if not chosen.isValid():
+            return
+        self._bg_base = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        self._apply_viewport_background()
+        self._update_bg_swatch()
+        self.plotter.render()
+
+    def _reset_background(self) -> None:
+        self._bg_base = theme.VIEWPORT_BG_CENTER
+        self._apply_viewport_background()
+        self._update_bg_swatch()
+        self.plotter.render()
+
+    def _update_bg_swatch(self) -> None:
+        """Show the current colour as a rounded chip on the button."""
+        colour = QColor.fromRgbF(*self._bg_base)
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(colour)
+        painter.setPen(QColor(255, 255, 255, 60))
+        painter.drawRoundedRect(1, 1, 14, 14, 4, 4)
+        painter.end()
+        self.bg_button.setIcon(pm)
+
+    def _apply_viewport_background(self) -> None:
+        """Soft radial vignette: lighter at the centre, darker at the edges."""
+        size = 256
+        yy, xx = np.mgrid[0:size, 0:size]
+        centre = (size - 1) / 2.0
+        radius = np.sqrt((xx - centre) ** 2 + (yy - centre) ** 2)
+        t = np.clip(radius / (centre * 1.35), 0.0, 1.0)
+        t = (t * t * (3 - 2 * t))[..., None]        # smoothstep falloff
+        inner = np.array(self._bg_base, dtype=float)
+        outer = inner * 0.46                        # darker toward the edges
+        # Held on the instance: pv.Texture wraps the array by reference, so a
+        # local would be freed and VTK would render garbage from stale memory.
+        self._bg_pixels = np.clip(
+            (inner * (1 - t) + outer * t) * 255, 0, 255).astype(np.uint8)
+
+        try:
+            self._bg_texture = pv.Texture(self._bg_pixels)
+            renderer = self.plotter.renderer
+            renderer.SetBackgroundTexture(self._bg_texture)
+            renderer.SetTexturedBackground(True)
+        except Exception:
+            # Fall back to a flat gradient if textured backgrounds aren't
+            # available on this driver.
+            self.plotter.set_background(tuple(np.array(self._bg_base) * 0.46),
+                                         top=self._bg_base)
+
+    def _add_orientation_axes(self) -> None:
+        self.plotter.add_axes(
+            interactive=False,
+            x_color=theme.AXIS_X, y_color=theme.AXIS_Y, z_color=theme.AXIS_Z,
+        )
 
     def _on_frame(self, frame: Frame) -> None:
         self._latest_frame = frame
@@ -704,6 +973,7 @@ class BaseStation(QMainWindow):
                 self._show_scale_grid(True)
 
         self.plotter.render()
+        self._maybe_record(frame)
 
     def _compute_colors(self, frame: Frame) -> np.ndarray:
         if self.color_combo.currentIndex() == 0:
@@ -747,7 +1017,7 @@ class BaseStation(QMainWindow):
 
     def _on_axes_toggled(self, checked: bool) -> None:
         if checked:
-            self.plotter.add_axes(interactive=False)
+            self._add_orientation_axes()
         else:
             self.plotter.hide_axes()
         self.plotter.render()
@@ -760,7 +1030,10 @@ class BaseStation(QMainWindow):
             # A small triad drawn at world (0, 0, 0) so the rover's origin
             # is always locatable in the scene.
             self._origin_actor = self.plotter.add_axes_at_origin(
-                labels_off=True, line_width=3)
+                labels_off=True, line_width=3,
+                x_color=theme.AXIS_X, y_color=theme.AXIS_Y,
+                z_color=theme.AXIS_Z,
+            )
         self.plotter.render()
 
     def _show_scale_grid(self, checked: bool) -> None:
@@ -778,10 +1051,27 @@ class BaseStation(QMainWindow):
                 xtitle="X (m)",
                 ytitle="Y (m)",
                 ztitle="Z (m)",
-                color=theme.TEXT_DIM,
+                color=theme.GRID_COLOR,
                 fmt="%.2f",
             )
+            self._fade_grid(self._bounds_actor)
         self.plotter.render()
+
+    @staticmethod
+    def _fade_grid(actor) -> None:
+        """Knock the gridlines back so they read as a reference, not content."""
+        if actor is None:
+            return
+        for axis in ("X", "Y", "Z"):
+            for kind in ("AxesLinesProperty", "AxesGridlinesProperty",
+                          "AxesInnerGridlinesProperty"):
+                getter = getattr(actor, f"Get{axis}{kind}", None)
+                if getter is None:
+                    continue
+                try:
+                    getter().SetOpacity(theme.GRID_OPACITY)
+                except AttributeError:
+                    pass
 
     def _reset_view(self) -> None:
         self.plotter.reset_camera()
@@ -793,49 +1083,153 @@ class BaseStation(QMainWindow):
 
     # -- capture ---------------------------------------------------------
 
+    def _default_capture_dir(self) -> str:
+        os.makedirs(CAPTURES_DIR, exist_ok=True)
+        return os.path.abspath(CAPTURES_DIR)
+
     def _save_pcd(self) -> None:
         if self._latest_frame is None or self._cloud is None:
-            self._set_status("No frame received yet - nothing to save.")
+            self._set_capture_status("No frame received yet - nothing to save.")
             return
+
+        suggested = os.path.join(
+            self._default_capture_dir(),
+            f"frame_{datetime.now():%Y%m%d_%H%M%S}.pcd")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save point cloud", suggested,
+            "Point cloud (*.pcd);;PLY (*.ply);;All files (*)")
+        if not path:
+            return
+
+        if self._write_cloud(path, self._latest_frame, self._color_buffer):
+            self._set_capture_status(
+                f"Saved {os.path.basename(path)} "
+                f"({self._latest_frame.num_points:,} pts)")
+        else:
+            self._set_capture_status(f"Could not write {os.path.basename(path)}")
+
+    @staticmethod
+    def _write_cloud(path: str, frame: Frame, colors: np.ndarray) -> bool:
         import open3d as o3d
 
-        os.makedirs(CAPTURES_DIR, exist_ok=True)
-        path = os.path.join(
-            CAPTURES_DIR, f"frame_{datetime.now():%Y%m%d_%H%M%S}.pcd")
-
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(
-            self._latest_frame.xyz.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(
-            np.asarray(self._cloud["colors"], dtype=np.float64) / 255.0)
-
-        if o3d.io.write_point_cloud(path, pcd):
-            self._set_status(f"Saved {path} ({self._latest_frame.num_points:,} pts)")
-        else:
-            self._set_status("Save failed - check the captures/ folder permissions.")
+        pcd.points = o3d.utility.Vector3dVector(frame.xyz.astype(np.float64))
+        if colors is not None and len(colors) == frame.num_points:
+            pcd.colors = o3d.utility.Vector3dVector(
+                np.asarray(colors, dtype=np.float64) / 255.0)
+        try:
+            return bool(o3d.io.write_point_cloud(path, pcd))
+        except (OSError, RuntimeError):
+            return False
 
     def _save_screenshot(self) -> None:
-        os.makedirs(CAPTURES_DIR, exist_ok=True)
-        path = os.path.join(
-            CAPTURES_DIR, f"view_{datetime.now():%Y%m%d_%H%M%S}.png")
-        self.plotter.screenshot(path)
-        self._set_status(f"Saved {path}")
+        suggested = os.path.join(
+            self._default_capture_dir(),
+            f"view_{datetime.now():%Y%m%d_%H%M%S}.png")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save screenshot", suggested,
+            "PNG image (*.png);;JPEG image (*.jpg);;All files (*)")
+        if not path:
+            return
+        try:
+            self.plotter.screenshot(path)
+        except (OSError, RuntimeError):
+            self._set_capture_status(f"Could not write {os.path.basename(path)}")
+            return
+        self._set_capture_status(f"Saved {os.path.basename(path)}")
 
-    def _set_status(self, text: str) -> None:
-        self.status_label.setText(text)
-        self._status_timer.start(4000)
+    def _set_capture_status(self, text: str) -> None:
+        self.capture_status.setText(text)
+        self._status_timer.start(5000)
+
+    # -- recording -------------------------------------------------------
+
+    def _choose_record_folder(self) -> None:
+        start = self._recorder.folder or self._default_capture_dir()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose a folder for recorded frames", start)
+        if folder:
+            self._recorder.folder = folder
+            self.rec_folder_label.setText(folder)
+
+    def _toggle_recording(self) -> None:
+        if self._recorder.active:
+            self._stop_recording("Recording stopped.")
+            return
+
+        folder = self._recorder.folder
+        if not folder:
+            self._choose_record_folder()
+            folder = self._recorder.folder
+            if not folder:
+                self.record_pill.set_state("error", "Choose a folder first.")
+                return
+
+        if self._worker is None:
+            self.record_pill.set_state(
+                "error", "Connect to a rover before recording.")
+            return
+
+        self._recorder.start(folder, self.rec_interval_spin.value(),
+                              self.rec_duration_spin.value())
+        self.record_button.setText("  Stop recording")
+        self.record_button.setIcon(icons.icon("stop", theme.TEXT, 15))
+        for widget in (self.rec_interval_spin, self.rec_duration_spin,
+                        self.rec_folder_button):
+            widget.setEnabled(False)
+        self.record_pill.set_state("connecting", "Recording... 0 frames")
+
+    def _stop_recording(self, message: str) -> None:
+        saved, failed = self._recorder.saved, self._recorder.failed
+        self._recorder.stop()
+        self.record_button.setText("  Start recording")
+        self.record_button.setIcon(icons.icon("record", theme.TEXT, 15))
+        for widget in (self.rec_interval_spin, self.rec_duration_spin,
+                        self.rec_folder_button):
+            widget.setEnabled(True)
+        detail = f"{message} {saved} frame{'s' if saved != 1 else ''} saved"
+        if failed:
+            detail += f", {failed} failed"
+        # Green is reserved for a genuinely completed action.
+        self.record_pill.set_state("live" if saved and not failed else "idle",
+                                    detail)
+
+    def _maybe_record(self, frame: Frame) -> None:
+        if not self._recorder.active:
+            return
+        if self._recorder.expired():
+            self._stop_recording("Recording complete.")
+            return
+        if not self._recorder.should_save():
+            return
+
+        name = (f"frame_{self._recorder.saved:05d}_"
+                f"{datetime.now():%Y%m%d_%H%M%S}.pcd")
+        path = os.path.join(self._recorder.folder, name)
+        ok = self._write_cloud(path, frame, self._color_buffer)
+        self._recorder.note_saved(ok)
+
+        remaining = max(0.0, self._recorder.duration - self._recorder.elapsed())
+        self.record_pill.set_state(
+            "connecting",
+            f"Recording... {self._recorder.saved} frames, "
+            f"{remaining:.0f}s left")
 
     # -- stats -----------------------------------------------------------
 
     def _refresh_stats(self) -> None:
         s = self._stats.snapshot()
-        self.stat_rate.set(f"{s['kbps']:.1f} KB/s")
-        self.stat_points_sec.set(f"{s['pts_per_sec']:,.0f}")
-        self.stat_count.set(f"{s['point_count']:,}")
-        self.stat_fetch.set(
+        self.stat_rate.setText(f"{s['kbps']:.1f} KB/s")
+        self.stat_points_sec.setText(f"{s['pts_per_sec']:,.0f}")
+        self.stat_count.setText(f"{s['point_count']:,}")
+        self.stat_fetch.setText(
             f"{s['fetch_seconds'] * 1000:.0f} ms" if s["fetch_seconds"] else "-")
-        self.stat_ok.set(str(s["frames_received"]))
-        self.stat_failed.set(str(s["frames_failed"]))
+        self.stat_ok.setText(str(s["frames_received"]))
+        self.stat_failed.setText(str(s["frames_failed"]))
+
+        # A recording can outlive its duration if frames stop arriving.
+        if self._recorder.expired():
+            self._stop_recording("Recording complete.")
 
     # -- lifecycle -------------------------------------------------------
 
@@ -843,6 +1237,9 @@ class BaseStation(QMainWindow):
         if self._worker is not None:
             self._worker.stop()
             self._worker.wait(3000)
+        if self._scanner is not None:
+            self._scanner.stop()
+            self._scanner.wait(3000)
         self.plotter.close()
         super().closeEvent(event)
 
@@ -882,7 +1279,9 @@ def main():
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    app.setStyleSheet(theme.STYLESHEET)
+    app.setApplicationName("Survey Rig Base Station")
+    app.setWindowIcon(icons.app_icon(theme.ACCENT))
+    app.setStyleSheet(theme.get_stylesheet())
 
     window = BaseStation(args.rover_host, args.rover_port, args.poll_interval,
                           timeout=args.timeout)
