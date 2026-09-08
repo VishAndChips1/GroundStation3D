@@ -32,7 +32,9 @@ import theme
 from protocol import Frame, MalformedFrameError, parse_frame
 
 CAPTURES_DIR = "captures"
-FETCH_TIMEOUT_SECONDS = 2.0
+# Generous by default: over real WiFi a full-resolution frame can be several
+# MB, and a tight timeout would fail every request on a marginal link.
+DEFAULT_FETCH_TIMEOUT = 10.0
 INVALID_THERMAL_COLOR = (128, 128, 128)  # gray for points with no thermal reading
 THERMAL_COLORMAP = "inferno"
 STATS_REFRESH_MS = 250
@@ -109,10 +111,12 @@ class PollWorker(QThread):
     frame_ready = Signal(object)
     state_changed = Signal(str, str)  # state ("live"/"waiting"/"error"), detail
 
-    def __init__(self, url: str, poll_interval: float, stats: NetworkStats):
+    def __init__(self, url: str, poll_interval: float, stats: NetworkStats,
+                 timeout: float = DEFAULT_FETCH_TIMEOUT):
         super().__init__()
         self._url = url
         self._poll_interval = poll_interval
+        self._timeout = timeout
         self._stats = stats
         self._stop_event = threading.Event()
         self._last_state = None
@@ -133,7 +137,7 @@ class PollWorker(QThread):
         while not self._stop_event.is_set():
             start = time.time()
             try:
-                with urllib.request.urlopen(self._url, timeout=FETCH_TIMEOUT_SECONDS) as resp:
+                with urllib.request.urlopen(self._url, timeout=self._timeout) as resp:
                     data = resp.read()
             except urllib.error.HTTPError as exc:
                 self._stats.record_failure()
@@ -222,10 +226,12 @@ class StatRow(QWidget):
 # --------------------------------------------------------------------------
 
 class BaseStation(QMainWindow):
-    def __init__(self, host: str, port: int, poll_interval: float):
+    def __init__(self, host: str, port: int, poll_interval: float,
+                 timeout: float = DEFAULT_FETCH_TIMEOUT):
         super().__init__()
         self.setWindowTitle("Survey Rig Base Station")
         self.resize(1500, 900)
+        self._timeout = timeout
 
         self._stats = NetworkStats()
         self._worker: PollWorker | None = None
@@ -470,7 +476,8 @@ class BaseStation(QMainWindow):
         url = f"http://{host}:{self.port_spin.value()}/latest.bin"
         self._stats.reset()
 
-        self._worker = PollWorker(url, self.interval_spin.value(), self._stats)
+        self._worker = PollWorker(url, self.interval_spin.value(), self._stats,
+                                   timeout=self._timeout)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.start()
@@ -731,6 +738,9 @@ def main():
                          help="rover IP to pre-fill (editable in the GUI)")
     parser.add_argument("--rover-port", type=int, default=8080)
     parser.add_argument("--poll-interval", type=float, default=0.2)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_FETCH_TIMEOUT,
+                         help="HTTP request timeout in seconds; raise it for "
+                              "large frames over a slow WiFi link")
     parser.add_argument("--connect", action="store_true",
                          help="connect immediately on startup")
     args = parser.parse_args()
@@ -738,7 +748,8 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(theme.STYLESHEET)
 
-    window = BaseStation(args.rover_host, args.rover_port, args.poll_interval)
+    window = BaseStation(args.rover_host, args.rover_port, args.poll_interval,
+                          timeout=args.timeout)
     window.showMaximized()
     if args.connect and args.rover_host:
         window._connect()

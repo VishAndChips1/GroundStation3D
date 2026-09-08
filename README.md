@@ -60,14 +60,29 @@ python main.py --rover-host 192.168.1.50 --rover-port 8080 --connect
 
 - `--rover-host` / `--rover-port` — pre-fill the connection fields
 - `--poll-interval` — minimum seconds between requests (default `0.2`)
+- `--timeout` — HTTP request timeout (default `10`); raise it for large
+  frames over a slow link
 - `--connect` — connect immediately on startup
 
 ### Finding the rover's IP
 
 - **Rig on WiFi:** whatever address the rover reports on the shared network.
-- **Sender running in WSL:** run `wsl hostname -I` in Windows PowerShell and
-  use that address (it changes when WSL restarts).
+  Nothing here is WiFi- or WSL-specific — the app is a plain HTTP client, so
+  any reachable host works.
+- **Sender running in WSL on this machine:** run `wsl hostname -I` in
+  PowerShell and use that address (e.g. `172.18.213.120`). It changes when
+  WSL restarts. `127.0.0.1` also works, since WSL2 forwards localhost.
 - **Same machine:** `127.0.0.1`.
+
+> **Note on WSL and other devices:** WSL2 sits behind NAT, so a *different*
+> machine on the WiFi cannot reach a WSL-hosted server without explicit
+> port forwarding (`netsh interface portproxy`). A real rover on the WiFi
+> has its own address and needs none of that.
+
+### Sender requirements
+
+The sender must bind `0.0.0.0` (not `127.0.0.1`) to be reachable from
+another machine. The rig's `fusion_web_streamer.py` already does.
 
 ### Testing without the rover
 
