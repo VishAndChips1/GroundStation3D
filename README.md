@@ -49,8 +49,16 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Then type the rover's IP into **Rover host**, set the port (default 8080),
-and press **Connect**.
+Then either:
+
+1. Press **Scan for senders** — it probes this machine, any running WSL
+   distro, and every host on your local subnets, and lists the ones
+   actually serving point clouds (with their point count, so it's obvious
+   which is the rig). Pick one and press **Connect**.
+2. Or type the IP straight into **Rover host** and press **Connect**.
+
+Hosts you've connected to before are remembered and reappear in the
+dropdown next launch.
 
 Optional flags (all also editable in the GUI):
 
@@ -65,6 +73,9 @@ python main.py --rover-host 192.168.1.50 --rover-port 8080 --connect
 - `--connect` — connect immediately on startup
 
 ### Finding the rover's IP
+
+**Scan for senders** in the app usually answers this for you. If you'd
+rather look it up manually:
 
 - **Rig on WiFi:** whatever address the rover reports on the shared network.
   Nothing here is WiFi- or WSL-specific — the app is a plain HTTP client, so
@@ -125,6 +136,7 @@ frame and a correspondingly lower practical poll rate over WiFi.
 | --- | --- |
 | `main.py` | Qt window, 3D view, polling thread, stats |
 | `protocol.py` | Wire format — the only file to touch if it changes |
+| `discovery.py` | Network scan that finds senders on the local subnets |
 | `theme.py` | Dark theme stylesheet |
 | `tools/mock_rover_server.py` | Synthetic sender for testing without hardware |
 

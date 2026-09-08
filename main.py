@@ -7,6 +7,7 @@ See protocol.py for the wire format and README.md for usage.
 """
 
 import faulthandler
+import json
 import os
 import sys
 import threading
@@ -28,8 +29,12 @@ from PySide6.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 
+import discovery
 import theme
 from protocol import Frame, MalformedFrameError, parse_frame
+
+RECENT_HOSTS_FILE = "recent_hosts.json"
+MAX_RECENT_HOSTS = 8
 
 CAPTURES_DIR = "captures"
 # Generous by default: over real WiFi a full-resolution frame can be several
@@ -183,6 +188,31 @@ class PollWorker(QThread):
         return text[:80]
 
 
+class DiscoveryWorker(QThread):
+    """Scans the local network for point-cloud senders, off the GUI thread."""
+
+    found = Signal(str, int)      # host, point count
+    progress = Signal(str)
+    done = Signal(int)            # number of senders found
+
+    def __init__(self, port: int):
+        super().__init__()
+        self._port = port
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        self.progress.emit("Scanning local network...")
+        results = discovery.scan(
+            self._port,
+            on_found=lambda host, n: self.found.emit(host, n),
+            should_stop=self._stop_event.is_set,
+        )
+        self.done.emit(len(results))
+
+
 # --------------------------------------------------------------------------
 # GUI helpers
 # --------------------------------------------------------------------------
@@ -235,6 +265,8 @@ class BaseStation(QMainWindow):
 
         self._stats = NetworkStats()
         self._worker: PollWorker | None = None
+        self._scanner: DiscoveryWorker | None = None
+        self._scan_hits = 0
         self._latest_frame: Frame | None = None
         self._cloud: pv.PolyData | None = None
         self._actor = None
@@ -264,6 +296,12 @@ class BaseStation(QMainWindow):
 
         # -- side panel --------------------------------------------------
         root.addWidget(self._build_panel(host, port, poll_interval))
+
+        # Previously-used hosts, so a returning user can just pick one.
+        # Re-apply any CLI host afterwards: populating the combo can move
+        # the current index and overwrite the editable text.
+        self._load_recent_hosts()
+        self.host_combo.setCurrentText(host or "")
 
         self._show_origin(True)
         self._show_scale_grid(True)
@@ -304,12 +342,31 @@ class BaseStation(QMainWindow):
         # -- connection ---------------------------------------------------
         layout.addWidget(make_section_label("Connection"))
 
-        self.host_edit = QLineEdit(host)
-        self.host_edit.setPlaceholderText("rover IP, e.g. 192.168.1.50")
-        self.host_edit.setToolTip(
+        self.host_combo = QComboBox()
+        self.host_combo.setEditable(True)
+        self.host_combo.lineEdit().setPlaceholderText("rover IP, e.g. 192.168.1.50")
+        self.host_combo.setToolTip(
             "IP or hostname of the machine serving /latest.bin.\n"
-            "Works with any sender on the network -- WSL, a Pi on the rig, etc.")
-        layout.addWidget(self._labeled("Rover host", self.host_edit))
+            "Type one in, or press Scan to find senders on this network.\n"
+            "Works with any sender -- WSL, a Pi on the rig, a rover on WiFi.")
+        # Picking a discovered entry drops the "- N pts" label and leaves the
+        # bare host in the editable field.
+        self.host_combo.activated.connect(self._on_host_picked)
+        if host:
+            self.host_combo.setCurrentText(host)
+        layout.addWidget(self._labeled("Rover host", self.host_combo))
+
+        self.scan_button = QPushButton("Scan for senders")
+        self.scan_button.setToolTip(
+            "Probes this machine, any WSL distro, and the local subnets for\n"
+            "servers actually answering /latest.bin.")
+        self.scan_button.clicked.connect(self._toggle_scan)
+        layout.addWidget(self.scan_button)
+
+        self.scan_label = QLabel("")
+        self.scan_label.setObjectName("StatusLabel")
+        self.scan_label.setWordWrap(True)
+        layout.addWidget(self.scan_label)
 
         port_row = QWidget()
         port_layout = QHBoxLayout(port_row)
@@ -459,6 +516,83 @@ class BaseStation(QMainWindow):
         layout.addWidget(widget)
         return container
 
+    # -- discovery ------------------------------------------------------
+
+    def _on_host_picked(self, index: int) -> None:
+        host = self.host_combo.itemData(index)
+        if host:
+            self.host_combo.setCurrentText(host)
+
+    def _toggle_scan(self) -> None:
+        if self._scanner is not None:
+            self._scanner.stop()
+            self.scan_label.setText("Scan cancelled.")
+            self._finish_scan()
+            return
+
+        self._scan_hits = 0
+        self._scanner = DiscoveryWorker(self.port_spin.value())
+        self._scanner.found.connect(self._on_sender_found)
+        self._scanner.progress.connect(self.scan_label.setText)
+        self._scanner.done.connect(self._on_scan_done)
+        self._scanner.start()
+        self.scan_button.setText("Stop scan")
+
+    def _on_sender_found(self, host: str, num_points: int) -> None:
+        self._scan_hits += 1
+        label = f"{host}  -  {num_points:,} pts"
+        for i in range(self.host_combo.count()):
+            if self.host_combo.itemData(i) == host:
+                self.host_combo.setItemText(i, label)
+                break
+        else:
+            self.host_combo.insertItem(0, label, host)
+        # First hit becomes the selection, so Connect works straight away.
+        if self._scan_hits == 1:
+            self.host_combo.setCurrentText(host)
+
+    def _on_scan_done(self, count: int) -> None:
+        if count:
+            self.scan_label.setText(
+                f"Found {count} sender{'s' if count != 1 else ''} - "
+                "pick one above, then Connect.")
+        else:
+            self.scan_label.setText(
+                f"No senders answering on port {self.port_spin.value()}. "
+                "Check the rover server is running and on this network.")
+        self._finish_scan()
+
+    def _finish_scan(self) -> None:
+        if self._scanner is not None:
+            self._scanner.wait(2000)
+            self._scanner = None
+        self.scan_button.setText("Scan for senders")
+
+    # -- recent hosts ----------------------------------------------------
+
+    def _load_recent_hosts(self) -> None:
+        try:
+            with open(RECENT_HOSTS_FILE, encoding="utf-8") as handle:
+                hosts = json.load(handle)
+        except (OSError, ValueError):
+            return
+        for host in hosts:
+            if isinstance(host, str) and host:
+                self.host_combo.addItem(host, host)
+
+    def _remember_host(self, host: str) -> None:
+        hosts = [host]
+        for i in range(self.host_combo.count()):
+            existing = self.host_combo.itemData(i)
+            if existing and existing != host:
+                hosts.append(existing)
+        hosts = hosts[:MAX_RECENT_HOSTS]
+        try:
+            with open(RECENT_HOSTS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(hosts, handle)
+        except OSError:
+            pass  # a non-writable folder shouldn't break connecting
+
     # -- connection -----------------------------------------------------
 
     def _toggle_connection(self) -> None:
@@ -468,13 +602,15 @@ class BaseStation(QMainWindow):
             self._connect()
 
     def _connect(self) -> None:
-        host = self.host_edit.text().strip()
+        host = self.host_combo.currentText().strip()
         if not host:
-            self.connection_label.setText("Enter the rover's IP address first.")
+            self.connection_label.setText(
+                "Enter the rover's IP, or press Scan to find one.")
             return
 
         url = f"http://{host}:{self.port_spin.value()}/latest.bin"
         self._stats.reset()
+        self._remember_host(host)
 
         self._worker = PollWorker(url, self.interval_spin.value(), self._stats,
                                    timeout=self._timeout)
@@ -486,7 +622,7 @@ class BaseStation(QMainWindow):
         self.connect_button.setObjectName("")
         self.connect_button.setStyleSheet("")
         self.connection_label.setText(f"Polling {url}")
-        for widget in (self.host_edit, self.port_spin, self.interval_spin):
+        for widget in (self.host_combo, self.port_spin, self.interval_spin, self.scan_button):
             widget.setEnabled(False)
         self._restyle(self.connect_button)
 
@@ -498,7 +634,7 @@ class BaseStation(QMainWindow):
         self.connect_button.setText("Connect")
         self.connect_button.setObjectName("PrimaryButton")
         self.connection_label.setText("Not connected")
-        for widget in (self.host_edit, self.port_spin, self.interval_spin):
+        for widget in (self.host_combo, self.port_spin, self.interval_spin, self.scan_button):
             widget.setEnabled(True)
         self._restyle(self.connect_button)
 
