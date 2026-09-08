@@ -87,6 +87,11 @@ _ICONS: dict[str, str] = {
         '<circle cx="12" cy="12" r="9"/>'
         '<rect x="9" y="9" width="6" height="6" rx="1.2" fill="{c}" stroke="none"/>'
     ),
+    "pause": (
+        '<rect x="6" y="4" width="4" height="16" rx="1" fill="{c}" stroke="none"/>'
+        '<rect x="14" y="4" width="4" height="16" rx="1" fill="{c}" stroke="none"/>'
+    ),
+    "play": '<path d="M7 4v16l13-8z" fill="{c}" stroke="none" stroke-linejoin="round"/>',
     "folder": (
         '<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v9a2 '
         '2 0 0 1-2 2z"/>'

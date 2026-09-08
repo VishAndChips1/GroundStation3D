@@ -204,3 +204,92 @@ class TitleBar(QFrame):
         self._max_button.setIcon(icons.icon(
             "restore" if maximized else "maximize",
             theme.TEXT_MUTED, 16, stroke=1.8))
+
+
+class BlinkingDot(QWidget):
+    """A small round LED, blinking red while active."""
+
+    def __init__(self, diameter: int = 10):
+        super().__init__()
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedSize(diameter, diameter)
+        self._radius = diameter // 2
+        self._active = False
+        self._lit = True
+        self._timer = QTimer(self)
+        self._timer.setInterval(550)
+        self._timer.timeout.connect(self._tick)
+        self._paint()
+
+    def set_active(self, active: bool) -> None:
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            self._lit = True
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self._paint()
+
+    def _tick(self) -> None:
+        self._lit = not self._lit
+        self._paint()
+
+    def _paint(self) -> None:
+        if not self._active:
+            color = "rgba(255, 255, 255, 0.18)"
+        elif self._lit:
+            color = theme.DANGER
+        else:
+            color = "rgba(217, 83, 79, 0.30)"
+        self.setStyleSheet(
+            f"background-color: {color}; border-radius: {self._radius}px;")
+
+
+class CanvasOverlay(QFrame):
+    """Floating pill over the 3D viewport: live LED + a Pause/Resume toggle.
+
+    One button whose label/icon flips between the two states, per the
+    request -- not a separate pause and resume button.
+    """
+
+    pause_toggled = Signal(bool)  # emits the new paused state
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("CanvasOverlay")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._paused = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(
+            theme.SPACE_3, theme.SPACE_2, theme.SPACE_3, theme.SPACE_2)
+        layout.setSpacing(theme.SPACE_2)
+
+        self.dot = BlinkingDot(10)
+        layout.addWidget(self.dot, 0, Qt.AlignVCenter)
+
+        self.button = QPushButton()
+        self.button.setObjectName("OverlayButton")
+        self.button.setCursor(Qt.PointingHandCursor)
+        self.button.clicked.connect(self._toggle)
+        layout.addWidget(self.button)
+
+        self._apply_button_state()
+
+    def _toggle(self) -> None:
+        self._paused = not self._paused
+        self._apply_button_state()
+        self.pause_toggled.emit(self._paused)
+
+    def _apply_button_state(self) -> None:
+        if self._paused:
+            self.button.setText("  Resume")
+            self.button.setIcon(icons.icon("play", theme.TEXT, 14))
+        else:
+            self.button.setText("  Pause")
+            self.button.setIcon(icons.icon("pause", theme.TEXT, 14))
+
+    def set_live(self, live: bool) -> None:
+        self.dot.set_active(live)

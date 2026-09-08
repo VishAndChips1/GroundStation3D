@@ -21,7 +21,7 @@ from datetime import datetime
 import matplotlib
 import numpy as np
 import pyvista as pv
-from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
@@ -343,6 +343,23 @@ class BaseStation(QMainWindow):
         self._add_orientation_axes()
         root.addWidget(self.plotter.interactor, stretch=1)
 
+        # Floating Pause/Resume + live LED, anchored to the viewport's
+        # top-right corner. Parented to the interactor itself (not the
+        # layout) since it needs to float over the render surface rather
+        # than take up its own layout slot.
+        self._view_paused = False
+        self.canvas_overlay = widgets.CanvasOverlay()
+        self.canvas_overlay.setParent(self.plotter.interactor)
+        self.canvas_overlay.pause_toggled.connect(self._on_pause_toggled)
+        self.canvas_overlay.adjustSize()
+        self.canvas_overlay.show()
+        self.canvas_overlay.raise_()
+        # React to the *viewport's* resize, not the window's -- it's a
+        # direct signal that the space the overlay must fit inside changed,
+        # rather than assuming a correlation with the top-level window.
+        self.plotter.interactor.installEventFilter(self)
+        QTimer.singleShot(0, self._position_canvas_overlay)
+
         # -- side panel --------------------------------------------------
         root.addWidget(self._build_panel(host, port, poll_interval))
 
@@ -375,6 +392,20 @@ class BaseStation(QMainWindow):
         if event.type() == event.Type.WindowStateChange:
             self.title_bar.set_maximized(self.isMaximized())
         super().changeEvent(event)
+
+    def eventFilter(self, obj, event):
+        if obj is self.plotter.interactor and event.type() == QEvent.Resize:
+            self._position_canvas_overlay()
+        return super().eventFilter(obj, event)
+
+    def _position_canvas_overlay(self) -> None:
+        self.canvas_overlay.adjustSize()
+        margin = theme.SPACE_3
+        x = self.plotter.interactor.width() - self.canvas_overlay.width() - margin
+        self.canvas_overlay.move(max(0, x), margin)
+
+    def _on_pause_toggled(self, paused: bool) -> None:
+        self._view_paused = paused
 
     def nativeEvent(self, event_type, message):
         """Let Windows resize/snap a frameless window.
@@ -845,6 +876,7 @@ class BaseStation(QMainWindow):
         self.connect_button.setText("Connect")
         self.connect_button.setObjectName("PrimaryButton")
         self.status_pill.set_state("idle", "Not connected")
+        self.canvas_overlay.set_live(False)
         for widget in (self.host_combo, self.port_spin, self.interval_spin,
                         self.scan_button):
             widget.setEnabled(True)
@@ -856,6 +888,7 @@ class BaseStation(QMainWindow):
 
     def _on_state_changed(self, state: str, detail: str) -> None:
         self.status_pill.set_state(state, detail)
+        self.canvas_overlay.set_live(state == "live")
 
     # -- rendering -------------------------------------------------------
 
@@ -922,6 +955,13 @@ class BaseStation(QMainWindow):
         )
 
     def _on_frame(self, frame: Frame) -> None:
+        if self._view_paused:
+            # Data keeps arriving and stats keep counting (that happens on
+            # the worker thread, untouched by this), but the view -- and
+            # what Save/Record would act on -- stays exactly as it was
+            # when paused.
+            return
+
         self._latest_frame = frame
         if frame.num_points == 0:
             return
@@ -957,6 +997,15 @@ class BaseStation(QMainWindow):
                 render_points_as_spheres=False,
                 lighting=False,
                 render=False,
+                # Explicit, not left to default: add_mesh's default reset
+                # policy is "reset unless camera_set is True", and camera_set
+                # is PyVista's own Python-side bookkeeping flag, which stays
+                # False forever once a mouse-driven orbit happens (VTK's
+                # interactor style moves the camera without ever touching
+                # that flag). Real rover data changes point count almost
+                # every frame, forcing this rebuild path constantly -- left
+                # on default, every single one of those snaps the view back.
+                reset_camera=False,
             )
         else:
             # Same point count: the buffers VTK already points at have just

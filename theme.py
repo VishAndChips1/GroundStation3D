@@ -78,17 +78,21 @@ def resolve_font() -> str:
 
 
 _STYLESHEET_TEMPLATE = f"""
+/* No background-color here on purpose. A blanket QWidget background
+   forces every plain layout-wrapper widget (an icon+label row, a
+   Port/Interval pair, anything grouped with a bare QWidget()) to paint
+   its own opaque rectangle -- a different, wrong shade against whatever
+   card it sits inside. Only named, actually-visible surfaces (window,
+   title bar, panel, card, pill) get an explicit background below;
+   everything else stays transparent and shows its parent through. */
 QWidget {{
-    background-color: {BG_APP};
     color: {TEXT};
     font-family: {FONT_STACK};
     font-size: {FONT_SIZE_BASE}px;
 }}
 
-/* Labels and checkboxes must not paint their own panel colour, or every
-   caption shows up as a slightly-off rectangle against its card. */
-QLabel, QCheckBox {{
-    background: transparent;
+QMainWindow, QMainWindow > QWidget {{
+    background-color: {BG_APP};
 }}
 
 /* -- shell ------------------------------------------------------------- */
@@ -178,6 +182,27 @@ QFrame#StatusPill {{
     background-color: {BG_INPUT};
     border: 1px solid {BORDER};
     border-radius: {RADIUS_SM}px;
+}}
+
+/* Floating pill over the 3D viewport -- a HUD control, not a panel row,
+   so it gets its own translucent surface rather than the card colour. */
+QFrame#CanvasOverlay {{
+    background-color: rgba(20, 23, 28, 0.88);
+    border: 1px solid {BORDER_STRONG};
+    border-radius: {RADIUS}px;
+}}
+QPushButton#OverlayButton {{
+    background: transparent;
+    border: none;
+    padding: {SPACE_1}px {SPACE_2}px;
+    font-weight: 600;
+}}
+QPushButton#OverlayButton:hover {{
+    background-color: rgba(255, 255, 255, 0.10);
+    border-radius: {RADIUS_SM}px;
+}}
+QPushButton#OverlayButton:pressed {{
+    background-color: rgba(255, 255, 255, 0.16);
 }}
 
 /* -- buttons ----------------------------------------------------------- */
