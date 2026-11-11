@@ -1,0 +1,14 @@
+[Unit]
+Description=PitFusion3D power/control daemon (start/stop the sensor pipeline from the base station)
+# Independent of the pipeline on purpose: it must stay up while the
+# pipeline is stopped, so the base station can start it again.
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 @SCRIPT@
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

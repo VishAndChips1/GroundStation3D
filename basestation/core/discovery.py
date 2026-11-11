@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-from protocol import POINT_DTYPE
+from basestation.core.protocol import POINT_DTYPE
 
 PROBE_TIMEOUT = 0.6
 MAX_SUBNETS = 3

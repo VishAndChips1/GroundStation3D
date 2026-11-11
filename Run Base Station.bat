@@ -8,4 +8,4 @@ if not exist ".venv\Scripts\pythonw.exe" (
 )
 
 rem The rover IP is entered in the app window itself, so no prompt here.
-start "" ".venv\Scripts\pythonw.exe" main.py
+start "" ".venv\Scripts\pythonw.exe" -m basestation
