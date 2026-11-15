@@ -457,6 +457,64 @@ class PollWorkerTests(unittest.TestCase):
         self.assertEqual(snap["frames_failed"], 0)
         self.assertEqual(self.states[-1][0], "live")
 
+    def test_one_connection_is_reused_for_many_polls(self):
+        """A new connection per poll restarts TCP's slow start every time; the worker keeps one open."""
+        ports, body = set(), legacy_frame(40)
+
+        def respond(h):
+            ports.add(h.client_address[1])
+            send(h, body)
+
+        w, stats, _ = self.start(respond)
+        self.assertTrue(wait_for(lambda: stats.snapshot()["frames_received"] >= 8))
+        self.assertEqual(len(ports), 1)
+        self.assertEqual(stats.snapshot()["frames_failed"], 0)
+
+    def test_a_connection_the_rig_closed_is_reopened_quietly(self):
+        """The rig drops idle connections; that is not an error the user should see."""
+        body = legacy_frame(40)
+
+        def respond(h):
+            send(h, body)
+            h.close_connection = True                    # hang up after every reply, without announcing it
+
+        w, stats, _ = self.start(respond)
+        self.assertTrue(wait_for(lambda: stats.snapshot()["frames_received"] >= 6))
+        self.assertEqual(stats.snapshot()["frames_failed"], 0)
+        self.assertNotIn("error", [s for s, _ in self.states])
+
+    def test_adaptive_size_is_requested_only_after_the_rig_advertises_it_and_steps_down_when_slow(self):
+        paths, body = [], legacy_frame(40)
+
+        def respond(h):
+            paths.append(h.path)
+            if "n=3000" in h.path or "n=2000" in h.path:
+                time.sleep(0.25)                         # a struggling link: only the smallest size is quick
+            send(h, body, headers={"X-Quality-Levels": "1000,2000,3000"})
+
+        srv = Server(respond)
+        self.addCleanup(srv.close)
+        stats = NetworkStats()
+        w = PollWorker(f"http://127.0.0.1:{srv.port}/latest.bin", 0.02, stats, timeout=3.0)
+        w._quality.SLOW_S = 0.15                         # shrink the thresholds so the test is quick
+        w.start()
+        self.addCleanup(lambda: (w.stop(), w.wait(3000)))
+        self.assertTrue(wait_for(lambda: any("n=1000" in p for p in paths)))   # slow at 3000, then slow at 2000: down to 1000
+        self.assertEqual(paths[0], "/latest.bin")        # first request: sizes not yet known, so no ?n=
+        self.assertTrue(any("n=3000" in p for p in paths))
+        self.assertTrue(any("n=2000" in p for p in paths))
+
+    def test_old_rigs_that_do_not_advertise_sizes_are_never_sent_a_query(self):
+        paths, body = [], legacy_frame(40)
+
+        def respond(h):
+            paths.append(h.path)
+            send(h, body)
+
+        w, stats, _ = self.start(respond)
+        self.assertTrue(wait_for(lambda: len(paths) >= 5))
+        self.assertEqual(set(paths), {"/latest.bin"})
+
     def test_rig_format_end_to_end(self):
         xyz, rgb, t, body = rig_frame(150)
         w, stats, _ = self.start(lambda h: send(h, body, headers={"Content-Encoding": "gzip"}))
@@ -488,6 +546,55 @@ class PollWorkerTests(unittest.TestCase):
         w, stats, _ = self.start(lambda h: (calls.append(time.time()), send(h, b"", 500)), interval=0.02)
         time.sleep(1.2)
         self.assertLess(len(calls), 20, len(calls))                    # 20 ms interval would be ~60
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 not installed")
+class ControlPollDebounceTests(unittest.TestCase):
+    """One slow reply on a busy WiFi link must not flip a working rig to 'unreachable'."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QCoreApplication.instance() or QCoreApplication([])
+
+    def run_worker(self, kinds, fast=False):
+        from basestation.core import control
+        from basestation.net import workers
+        seq = list(kinds)
+        got = []
+
+        def fake_get_status(host, port, timeout=2.0):
+            kind = seq.pop(0) if seq else "ok"
+            return control.ControlStatus(kind, control.ON if kind == "ok" else control.OFFLINE)
+
+        real = workers.control.get_status
+        workers.control.get_status = fake_get_status
+        self.addCleanup(setattr, workers.control, "get_status", real)
+        w = workers.ControlWorker()
+        w.SLOW = w.FAST = 0.01
+        w.set_fast(fast)
+        w.status.connect(lambda st: got.append(st.kind), Qt.DirectConnection)
+        w.set_target("127.0.0.1", 8081)
+        w.start()
+        self.addCleanup(lambda: (w.stop(), w.wait(3000)))
+        wait_for(lambda: not seq and len(got) >= 1, 3.0)
+        time.sleep(0.15)
+        return got
+
+    def test_one_or_two_missed_polls_do_not_show_unreachable(self):
+        got = self.run_worker(["ok", "unreachable", "unreachable", "ok"])
+        self.assertNotIn("unreachable", got)
+
+    def test_three_misses_in_a_row_do_show_unreachable(self):
+        got = self.run_worker(["ok", "unreachable", "unreachable", "unreachable"])
+        self.assertIn("unreachable", got)
+
+    def test_before_the_rig_has_ever_answered_unreachable_is_reported_at_once(self):
+        got = self.run_worker(["unreachable"])
+        self.assertEqual(got[0], "unreachable")
+
+    def test_while_stopping_or_powering_off_one_miss_is_enough(self):
+        got = self.run_worker(["ok", "unreachable"], fast=True)
+        self.assertIn("unreachable", got)
 
 
 if __name__ == "__main__":

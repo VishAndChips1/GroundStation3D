@@ -5,6 +5,7 @@ import http.client
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 
@@ -12,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 
 from basestation.core import discovery
 from basestation.core.protocol import MalformedFrameError, parse_frame
+from basestation.core.quality import AdaptiveQuality
 
 # Generous by default: over real WiFi a full-resolution frame can be several
 # MB, and a tight timeout would fail every request on a marginal link.
@@ -111,9 +113,13 @@ class PollWorker(QThread):
     MAX_BACKOFF = 2.0
 
     def __init__(self, url: str, poll_interval: float, stats: NetworkStats,
-                 timeout: float = DEFAULT_FETCH_TIMEOUT):
+                 timeout: float = DEFAULT_FETCH_TIMEOUT, adaptive: bool = True):
         super().__init__()
         self._url = url
+        self._conn = None                    # one connection kept open between polls (a new one every poll restarts TCP's slow start)
+        self._target = "/"
+        self._adaptive = adaptive
+        self._quality = AdaptiveQuality()
         self._poll_interval = poll_interval
         self._timeout = timeout
         self._stats = stats
@@ -154,19 +160,78 @@ class PollWorker(QThread):
             self._last_state = (state, detail)
             self.state_changed.emit(state, detail)
 
+    def _connection(self):
+        """The open connection to the rig, created on first use."""
+        if self._conn is None:
+            parts = urllib.parse.urlsplit(self._url)            # ValueError for an unusable address
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                raise ValueError("unusable address")
+            cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+            self._conn = cls(parts.hostname, parts.port, timeout=self._timeout)
+            self._target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        return self._conn
+
+    def _drop_connection(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _request_target(self) -> str:
+        """The path to ask for, with ?n=<points> once the rig has said it supports sizes."""
+        n = self._quality.requested() if self._adaptive else None
+        if n is None or "n=" in self._target:
+            return self._target
+        return f"{self._target}{'&' if '?' in self._target else '?'}n={n}"
+
     def _fetch(self) -> bytes:
         headers = {"Accept-Encoding": "gzip"}
         if self._etag:
             headers["If-None-Match"] = self._etag      # lets the rig answer 304
-        req = urllib.request.Request(self._url, headers=headers)
+        resp = None
+        for attempt in (0, 1):
+            reused = self._conn is not None
+            conn = self._connection()
+            try:
+                conn.request("GET", self._request_target(), headers=headers)
+                if conn.sock is not None:
+                    conn.sock.settimeout(self._timeout)   # _read_body shortens it; a reused socket must start fresh
+                resp = conn.getresponse()
+                break
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                self._drop_connection()
+                if reused and attempt == 0:
+                    continue                              # the rig closed an idle connection: reconnect once, quietly
+                raise
+            except BaseException:
+                self._drop_connection()
+                raise
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                data = self._read_body(resp)
-                self._etag = resp.headers.get("ETag") or self._etag
-        except urllib.error.HTTPError as exc:
-            if exc.code == 304:
-                raise _NotModified() from None
+            if resp.status == 304:
+                resp.read()
+                if resp.will_close:
+                    self._drop_connection()
+                raise _NotModified()
+            if resp.status != 200:
+                resp.read()
+                raise urllib.error.HTTPError(self._url, resp.status, resp.reason, resp.headers, None)
+            data = self._read_body(resp)
+            self._etag = resp.headers.get("ETag") or self._etag
+            if self._adaptive:
+                levels = resp.headers.get("X-Quality-Levels", "")
+                try:
+                    self._quality.set_levels([int(x) for x in levels.split(",") if x.strip()])
+                except ValueError:
+                    pass                                  # a malformed header just means fixed quality
+        except _NotModified:
             raise
+        except BaseException:
+            self._drop_connection()                       # state unknown after any failure
+            raise
+        if resp.will_close:
+            self._drop_connection()
         return data
 
     def _read_body(self, resp) -> bytes:
@@ -226,6 +291,7 @@ class PollWorker(QThread):
                 data = self._fetch()
                 recv_time = time.time()
                 fetch_seconds = recv_time - start
+                self._quality.report(fetch_seconds, recv_time)
                 frame = parse_frame(data, frame_id, recv_time, fetch_seconds)
             except _Stopped:
                 break
@@ -244,6 +310,7 @@ class PollWorker(QThread):
                     http.client.HTTPException, ValueError) as exc:
                 if self._stop_event.is_set():
                     break                    # stop() closed the socket: not an error
+                self._quality.report(0.0, time.time(), failed=True)
                 failures += 1
                 self._fail(self._describe_error(exc))
             except Exception as exc:         # last resort: never die silently
@@ -256,6 +323,7 @@ class PollWorker(QThread):
                 self._emit_state("live", f"Live - {frame.num_points:,} points")
                 self._post(frame)
             self._rest(start, failures)
+        self._drop_connection()
 
     def _fail(self, detail: str) -> None:
         self._stats.record_failure()
@@ -372,6 +440,8 @@ class ControlWorker(QThread):
     status = Signal(object)    # control.ControlStatus
 
     SLOW, FAST = 2.0, 0.7      # seconds between polls; fast while starting/stopping
+    POLL_TIMEOUT = 6.0         # a busy WiFi link can delay one reply by several seconds
+    UNREACHABLE_AFTER = 3      # consecutive failed polls before the screen says "unreachable"
 
     def __init__(self):
         super().__init__()
@@ -380,10 +450,14 @@ class ControlWorker(QThread):
         self._fast = False
         self._wake = threading.Event()
         self._stop_event = threading.Event()
+        self._misses = 0
+        self._seen_ok = False
 
     def set_target(self, host: str, port: int) -> None:
         with self._lock:
             self._target = (host, port) if host else None
+            self._misses = 0
+            self._seen_ok = False
         self._wake.set()
 
     def set_fast(self, fast: bool) -> None:
@@ -396,15 +470,31 @@ class ControlWorker(QThread):
         self._stop_event.set()
         self._wake.set()
 
+    def _debounce(self, st) -> bool:
+        """True if this reply should reach the screen.
+
+        One slow reply on a busy WiFi link must not flip a working rig to "unreachable": once the rig has
+        answered, only UNREACHABLE_AFTER failures in a row count. Before it has ever answered, report at once.
+        """
+        if st.kind == "unreachable":
+            self._misses += 1
+            needed = 1 if self._fast else self.UNREACHABLE_AFTER     # while stopping/powering off, "gone" is the expected answer
+            return not self._seen_ok or self._misses >= needed
+        self._misses = 0
+        if st.kind == "ok":
+            self._seen_ok = True
+        return True
+
     def run(self) -> None:
         while not self._stop_event.is_set():
             with self._lock:
                 target = self._target
             if target is not None:
                 try:
-                    st = control.get_status(*target)
+                    st = control.get_status(*target, timeout=3.0 if self._fast else self.POLL_TIMEOUT)
                     st.target = target       # lets the GUI discard a late reply for an old host
-                    self.status.emit(st)
+                    if self._debounce(st):
+                        self.status.emit(st)
                 except Exception:            # a bad poll must not end the loop
                     pass
             self._wake.wait(self.FAST if self._fast else self.SLOW)

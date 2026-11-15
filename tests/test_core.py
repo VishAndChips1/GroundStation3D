@@ -236,5 +236,87 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(control.ui_state("failed"), control.FAILED)
 
 
+class SleepAndPowerStateTests(unittest.TestCase):
+    """The sleep action runs only the operator's hook; the status tells the app what a power-off will really do."""
+
+    def setUp(self):
+        import os
+        import stat
+        import tempfile
+        self.calls = []
+        self.dir = tempfile.mkdtemp()
+        self.hook = os.path.join(self.dir, "sleep_hook")
+        with open(self.hook, "w") as fh:
+            fh.write("#!/bin/sh\necho done\n")
+        os.chmod(self.hook, os.stat(self.hook).st_mode | stat.S_IXUSR)
+        self._old_hook = pc.SLEEP_HOOK
+        pc.SLEEP_HOOK = self.hook
+
+        def runner(cmd, timeout=20):
+            self.calls.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return 0, "ActiveState=inactive\nSubState=dead\nActiveEnterTimestamp=now"
+            if cmd[0] == "vcgencmd":
+                return 0, "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=1\n"
+            if cmd[0] == self.hook:
+                return 0, "lidar: low power confirmed\nasleep"
+            return 0, ""
+        self.runner = runner
+
+    def tearDown(self):
+        import shutil
+        pc.SLEEP_HOOK = self._old_hook
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_sleep_runs_exactly_the_hook_with_no_arguments(self):
+        ok, msg = pc.perform("sleep", self.runner)
+        self.assertTrue(ok)
+        self.assertEqual(self.calls, [[self.hook]])     # nothing from the request reaches a command line
+        self.assertEqual(msg, "asleep")
+
+    def test_sleep_is_refused_without_an_executable_hook(self):
+        import os
+        os.chmod(self.hook, 0o644)                      # present but not executable
+        ok, msg = pc.perform("sleep", self.runner)
+        self.assertFalse(ok)
+        self.assertIn("not set up", msg)
+        self.assertEqual(self.calls, [])
+        pc.SLEEP_HOOK = self.hook + ".missing"
+        self.assertFalse(pc.can_sleep())
+
+    def test_a_failing_hook_is_reported_as_failure(self):
+        ok, msg = pc.perform("sleep", lambda cmd, timeout=20: (1, "could not reach the lidar"))
+        self.assertFalse(ok)
+        self.assertEqual(msg, "could not reach the lidar")
+
+    def test_full_poweroff_reads_the_bootloader_setting(self):
+        self.assertIs(pc.full_poweroff(lambda c, t=5: (0, "[all]\nPOWER_OFF_ON_HALT=1\n")), True)
+        self.assertIs(pc.full_poweroff(lambda c, t=5: (0, "[all]\nPOWER_OFF_ON_HALT=0\n")), False)
+        self.assertIs(pc.full_poweroff(lambda c, t=5: (0, "[all]\nBOOT_UART=1\n")), False)   # default: stays in standby
+        self.assertIsNone(pc.full_poweroff(lambda c, t=5: (127, "vcgencmd: not found")))     # not a Pi
+
+    def test_status_and_sleep_over_http(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+        handler = pc.make_handler(lambda: "tok", runner=self.runner)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
+            st = control.get_status("127.0.0.1", port)
+            self.assertTrue(st.can_sleep)
+            self.assertIs(st.full_poweroff, True)
+            self.assertEqual(st.state, control.OFF)
+            ok, _ = control.send_action("127.0.0.1", port, "sleep", "wrong", timeout=5)
+            self.assertFalse(ok)
+            self.assertEqual([c for c in self.calls if c[0] == self.hook], [])   # a wrong token never runs the hook
+            ok, msg = control.send_action("127.0.0.1", port, "sleep", "tok", timeout=5)
+            self.assertTrue(ok)
+            self.assertEqual(msg, "asleep")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

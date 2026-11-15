@@ -61,7 +61,7 @@ cat > "$APP_DIR/pitfusion_control.py" <<'PITFUSION_CONTROL_PY_EOF'
 """Always-on power/control daemon for the PitFusion3D sensor PC.
 
 Lets the base station start, stop and restart the sensor pipeline (the
-`pitfusion3d.service` systemd user unit) and shut the Pi down.
+`pitfusion3d.service` systemd user unit), put the rig to sleep, and shut the Pi down.
 
 Why a separate process: "stop" tears down the whole pipeline, including
 fusion_web_streamer.py. Anything hosted inside the pipeline could never
@@ -71,7 +71,7 @@ stopping, crashing, or restarting.
 
     GET  /status                      no auth, read-only
     POST /control  {"action": ...}    header  X-Control-Token: <secret>
-                   action = start | stop | restart | shutdown
+                   action = start | stop | restart | sleep | shutdown
 
 Safety:
   * State-changing requests need the shared token. With no token configured
@@ -80,6 +80,10 @@ Safety:
     shell, and no request data reaches a command line.
   * Plain HTTP, no encryption: for a trusted LAN or the rig's own hotspot.
     Anyone who can sniff the network can read the token.
+  * "sleep" runs the operator's own hook script (default
+    ~/.config/pitfusion3d/sleep_hook, or $PITFUSION_SLEEP_HOOK) with no arguments, e.g.
+    to stop the pipeline and put a LiDAR into its lowest-power mode. The Pi stays up and
+    reachable; "start" wakes the rig. With no hook installed, "sleep" is refused.
   * "shutdown" needs a sudoers rule (see sensor_side/README.md) and is not
     reversible from here -- a powered-off Pi must be power-cycled by hand.
 
@@ -99,7 +103,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UNIT = "pitfusion3d.service"
-ACTIONS = ("start", "stop", "restart", "shutdown")
+ACTIONS = ("start", "stop", "restart", "sleep", "shutdown")
+SLEEP_HOOK = os.environ.get("PITFUSION_SLEEP_HOOK") or os.path.expanduser("~/.config/pitfusion3d/sleep_hook")
 DEFAULT_PORT = 8081
 DEFAULT_TOKEN_FILE = os.path.expanduser("~/.config/pitfusion3d/control_token")
 MAX_BODY = 1024
@@ -151,6 +156,22 @@ def can_shutdown(runner=run) -> bool:
     return code == 0
 
 
+def can_sleep() -> bool:
+    """True when an executable sleep hook is installed."""
+    return os.path.isfile(SLEEP_HOOK) and os.access(SLEEP_HOOK, os.X_OK)
+
+
+def full_poweroff(runner=run):
+    """True if a Pi 5 is set to cut all power when halted (EEPROM POWER_OFF_ON_HALT=1).
+
+    False if it is not, None if it cannot be read (not a Pi, or vcgencmd missing).
+    """
+    code, out = runner(["vcgencmd", "bootloader_config"], 5)
+    if code != 0 or "=" not in out:
+        return None
+    return any(line.replace(" ", "").strip() == "POWER_OFF_ON_HALT=1" for line in out.splitlines())
+
+
 def perform(action: str, runner=run, schedule=None) -> tuple[bool, str]:
     """Carry out one whitelisted action. Returns (ok, message)."""
     if action not in ACTIONS:
@@ -163,6 +184,12 @@ def perform(action: str, runner=run, schedule=None) -> tuple[bool, str]:
         # Answer first, then power off: the reply must leave before the NIC goes.
         (schedule or _after)(1.0, lambda: runner(["sudo", "-n", sysctl, "poweroff"], 10))
         return True, "shutting down"
+    if action == "sleep":
+        if not can_sleep():
+            return False, "sleep is not set up on this sensor PC (no sleep hook installed)"
+        code, out = runner([SLEEP_HOOK], 90)             # the operator's own script, no request data on its command line
+        last = out.splitlines()[-1] if out else ""
+        return (code == 0), (last or ("asleep" if code == 0 else "the sleep hook failed"))
     code, out = runner(["systemctl", "--user", action, UNIT], 25)
     return (code == 0), (out or f"{action} ok")
 
@@ -181,6 +208,7 @@ def make_handler(token_loader, runner=run, schedule=None, clock=time.monotonic):
     # second or two, so asking on every poll burned CPU (and battery) on the Pi
     # for an answer that almost never changes. Ask at most once a minute.
     shutdown_cache = {"value": False, "at": None}
+    poweroff_cache = {"value": None, "at": None}      # the EEPROM setting only changes at a reboot
 
     def cached_can_shutdown() -> bool:
         now = clock()
@@ -188,6 +216,13 @@ def make_handler(token_loader, runner=run, schedule=None, clock=time.monotonic):
             shutdown_cache["value"] = can_shutdown(runner)
             shutdown_cache["at"] = now
         return shutdown_cache["value"]
+
+    def cached_full_poweroff():
+        now = clock()
+        if poweroff_cache["at"] is None or now - poweroff_cache["at"] >= SHUTDOWN_CHECK_TTL:
+            poweroff_cache["value"] = full_poweroff(runner)
+            poweroff_cache["at"] = now
+        return poweroff_cache["value"]
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -213,7 +248,9 @@ def make_handler(token_loader, runner=run, schedule=None, clock=time.monotonic):
             st = pipeline_status(runner)
             st.update({"hostname": socket.gethostname(),
                        "control": "enabled" if token_loader() else "disabled",
-                       "can_shutdown": cached_can_shutdown()})
+                       "can_shutdown": cached_can_shutdown(),
+                       "can_sleep": can_sleep(),
+                       "full_poweroff": cached_full_poweroff()})
             self._json(200, st)
 
         def do_POST(self):

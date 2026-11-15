@@ -44,6 +44,8 @@ class ControlStatus:
     state: str = OFFLINE
     control_enabled: bool = False
     can_shutdown: bool = False
+    can_sleep: bool = False          # the sensor PC has a sleep hook installed
+    full_poweroff: object = None     # True: a halted Pi 5 draws almost nothing; False: it stays in standby; None: unknown
     hostname: str = ""
     since: str = ""
     detail: str = ""
@@ -83,6 +85,8 @@ def get_status(host: str, port: int, timeout: float = 2.0) -> ControlStatus:
         "ok", ui_state(data.get("pipeline", "")),
         control_enabled=data.get("control") == "enabled",
         can_shutdown=bool(data.get("can_shutdown")),
+        can_sleep=bool(data.get("can_sleep")),
+        full_poweroff=data.get("full_poweroff") if isinstance(data.get("full_poweroff"), bool) else None,
         hostname=str(data.get("hostname", "")), since=str(data.get("since", "")),
         installed=bool(data.get("installed", True)))
 
@@ -90,6 +94,8 @@ def get_status(host: str, port: int, timeout: float = 2.0) -> ControlStatus:
 def send_action(host: str, port: int, action: str, token: str,
                 timeout: float = 30.0) -> tuple[bool, str]:
     """POST one command. Returns (ok, human-readable message)."""
+    if action == "sleep":
+        timeout = max(timeout, 90.0)     # stopping the pipeline and switching the LiDAR can take a while
     body = json.dumps({"action": action}).encode()
     req = urllib.request.Request(
         http_url(host, port, "/control"), data=body, method="POST",

@@ -1043,7 +1043,7 @@ class BaseStation(QMainWindow):
                 else:
                     state = control.STOPPING
             else:
-                target = control.OFF if action == "stop" else control.ON
+                target = control.OFF if action in ("stop", "sleep") else control.ON
                 if st.kind == "ok" and state == target:
                     self._pending = None              # did what was asked
                     self._set_power_hint("")
@@ -1054,7 +1054,7 @@ class BaseStation(QMainWindow):
                 elif now > deadline:
                     self._pending = None
                 else:
-                    state = control.STOPPING if action == "stop" else control.STARTING
+                    state = control.STOPPING if action in ("stop", "sleep") else control.STARTING
 
         if st.kind == "ok" and not st.installed and self._pending is None:
             # The Pi answers, but there is no pitfusion3d.service to start or stop
@@ -1142,6 +1142,11 @@ class BaseStation(QMainWindow):
         menu = QMenu(self)
         menu.addAction("Restart sensors", lambda: self._send("restart"))
         menu.addAction("Stop sensors", lambda: self._send("stop"))
+        can_sleep = bool(self._control_status and self._control_status.can_sleep)
+        sleep = menu.addAction("Sleep (stop sensors, LiDAR to low power)" if can_sleep
+                               else "Sleep... (not set up on the Pi)",
+                               lambda: self._send("sleep"))
+        sleep.setEnabled(can_sleep)
         menu.addSeparator()
         can = bool(self._control_status and self._control_status.can_shutdown)
         poweroff = menu.addAction("Power off Raspberry Pi..." if can
@@ -1160,8 +1165,11 @@ class BaseStation(QMainWindow):
             "It cannot be turned back on from this app. Someone has to press the power "
             "button on the Pi (or disconnect and reconnect its power) before it will "
             "start again.\n\n"
-            "The board stays in a low-power standby afterwards (its light stays on), and "
-            "anything powered separately, such as the lidar, keeps running.")
+            + ("The Pi then switches off completely (it draws almost nothing). "
+               if self._control_status is not None and self._control_status.full_poweroff
+               else "The board stays in a low-power standby afterwards (its light stays on). ")
+            + "Anything powered separately, such as the lidar, keeps its own power unless the "
+              "Pi puts it to sleep first.")
         off = box.addButton("Power off", QMessageBox.DestructiveRole)
         off.setObjectName("DestructiveButton")
         cancel = box.addButton("Cancel", QMessageBox.RejectRole)
@@ -1176,8 +1184,8 @@ class BaseStation(QMainWindow):
         if action == "shutdown" and not self._confirm_power_off():
             return
         host = self._current_host()
-        self._pending = (action, time.time() + (30 if action == "shutdown" else 45))
-        self._show_power_state(control.STOPPING if action in ("stop", "shutdown")
+        self._pending = (action, time.time() + {"shutdown": 30, "sleep": 95}.get(action, 45))
+        self._show_power_state(control.STOPPING if action in ("stop", "shutdown", "sleep")
                                else control.STARTING)
         self._action_worker = ActionWorker(host, self.control_port_spin.value(), action,
                                            self.token_edit.text().strip())
@@ -1194,6 +1202,12 @@ class BaseStation(QMainWindow):
             self._set_power_hint(
                 "Powering off. Once it has stopped, press the power button on the "
                 "Raspberry Pi to turn it back on.")
+            if self._worker is not None:
+                self._disconnect()
+        elif action == "sleep":
+            self._set_power_hint(
+                "Asleep: sensors stopped and the LiDAR in low power. The Pi is still on and "
+                "reachable; use the power button here to wake the sensors.")
             if self._worker is not None:
                 self._disconnect()
         self._control.poll_now()
