@@ -113,9 +113,12 @@ class PollWorker(QThread):
     MAX_BACKOFF = 2.0
 
     def __init__(self, url: str, poll_interval: float, stats: NetworkStats,
-                 timeout: float = DEFAULT_FETCH_TIMEOUT, adaptive: bool = True):
+                 timeout: float = DEFAULT_FETCH_TIMEOUT, adaptive: bool = True, compact: bool = True):
         super().__init__()
         self._url = url
+        self._compact = compact              # ask for the smaller frame format once the rig says it has one
+        self._rig_has_compact = False
+        self._fetched_fmt = 0                # the format the most recent request asked for
         self._conn = None                    # one connection kept open between polls (a new one every poll restarts TCP's slow start)
         self._target = "/"
         self._adaptive = adaptive
@@ -182,9 +185,16 @@ class PollWorker(QThread):
     def _request_target(self) -> str:
         """The path to ask for, with ?n=<points> once the rig has said it supports sizes."""
         n = self._quality.requested() if self._adaptive else None
-        if n is None or "n=" in self._target:
+        extras = []
+        if self._compact and self._rig_has_compact:
+            extras.append("fmt=2")
+        if n is not None and "n=" not in self._target:
+            extras.append(f"n={n}")
+        if not extras:
+            self._fetched_fmt = 0
             return self._target
-        return f"{self._target}{'&' if '?' in self._target else '?'}n={n}"
+        self._fetched_fmt = 2 if "fmt=2" in extras else 0
+        return f"{self._target}{'&' if '?' in self._target else '?'}{'&'.join(extras)}"
 
     def _fetch(self) -> bytes:
         headers = {"Accept-Encoding": "gzip"}
@@ -219,6 +229,7 @@ class PollWorker(QThread):
                 raise urllib.error.HTTPError(self._url, resp.status, resp.reason, resp.headers, None)
             data = self._read_body(resp)
             self._etag = resp.headers.get("ETag") or self._etag
+            self._rig_has_compact = "2" in [x.strip() for x in resp.headers.get("X-Formats", "").split(",")]
             if self._adaptive:
                 levels = resp.headers.get("X-Quality-Levels", "")
                 try:
@@ -292,7 +303,7 @@ class PollWorker(QThread):
                 recv_time = time.time()
                 fetch_seconds = recv_time - start
                 self._quality.report(fetch_seconds, recv_time)
-                frame = parse_frame(data, frame_id, recv_time, fetch_seconds)
+                frame = parse_frame(data, frame_id, recv_time, fetch_seconds, fmt=self._fetched_fmt)
             except _Stopped:
                 break
             except _NotModified:

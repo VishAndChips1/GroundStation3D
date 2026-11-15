@@ -20,6 +20,13 @@ the same bytes, because 4 + 28*N == 24 + 11*N has no integer solution:
         xyz = q * scale + offset (metres); rgb 0-255;
         thermal = Kelvin * 100, with -32768 meaning "no reading".
 
+  "compact" (format 2, about 3.5-5.5 bytes/point), requested with ?fmt=2 once the rig advertises it
+  in its X-Formats header (so it cannot be told apart by length: the caller says which one it asked for):
+      uint32 N, uint32 seq, float32 ox, oy, oz, quantum, uint32 flags     (28 bytes; flags bit 0 = thermal present)
+      then N x int16 each of dx, dy, dz  (differences between neighbouring points, running sum x quantum + origin),
+      [N x int16 thermal * 100, -32768 = none, only if flagged], then N x uint8 each of dr, dg, db
+      (differences modulo 256; a running sum rebuilds the colour exactly).
+
 A gzip wrapper is detected by its magic bytes and removed first. Points whose
 coordinates are NaN or infinite (a lidar's "no return") are dropped here, once,
 so nothing downstream -- bounds, camera, voxel keys -- ever sees them.
@@ -36,6 +43,7 @@ import numpy as np
 
 COUNT_STRUCT = struct.Struct("<I")
 RIG_HEADER = struct.Struct("<IIffff")          # n, seq, ox, oy, oz, scale
+COMPACT_HEADER = struct.Struct("<IIffffI")     # n, seq, ox, oy, oz, quantum, flags
 THERMAL_SENTINEL = -32768
 MAX_DECOMPRESSED_BYTES = 768 * 1024 * 1024     # refuse gzip bombs / absurd frames
 
@@ -91,10 +99,11 @@ def gunzip(data: bytes, limit: int = MAX_DECOMPRESSED_BYTES) -> bytes:
 
 
 def parse_frame(data: bytes, frame_id: int, recv_time: float,
-                fetch_seconds: float) -> Frame:
+                fetch_seconds: float, fmt: int = 0) -> Frame:
     """Parse one /latest.bin response body into a Frame.
 
-    Raises MalformedFrameError if the body fits neither layout.
+    fmt=2 says the body was requested as the compact format (it is not guessed from the length).
+    Raises MalformedFrameError if the body fits no expected layout.
     """
     if is_gzip(data):
         data = gunzip(data)
@@ -102,7 +111,9 @@ def parse_frame(data: bytes, frame_id: int, recv_time: float,
         raise MalformedFrameError(f"body too short for header: {len(data)} bytes")
 
     (n,) = COUNT_STRUCT.unpack_from(data, 0)
-    if len(data) == COUNT_STRUCT.size + n * POINT_DTYPE.itemsize:
+    if fmt == 2:
+        xyz, rgb, temp_c = _decode_compact(data, n)
+    elif len(data) == COUNT_STRUCT.size + n * POINT_DTYPE.itemsize:
         xyz, rgb, temp_c = _decode_float32(data, n)
     elif len(data) == RIG_HEADER.size + n * RIG_POINT_DTYPE.itemsize:
         xyz, rgb, temp_c = _decode_rig(data, n)
@@ -173,3 +184,36 @@ def encode_rig_frame(xyz: np.ndarray, rgb01: np.ndarray, thermal_k: np.ndarray,
         import gzip
         return gzip.compress(body, compresslevel=3)
     return body
+
+
+def _decode_compact(data: bytes, n: int):
+    if len(data) < COMPACT_HEADER.size:
+        raise MalformedFrameError(f"compact frame too short for its header: {len(data)} bytes")
+    _n, _seq, ox, oy, oz, quantum, flags = COMPACT_HEADER.unpack_from(data, 0)
+    has_thermal = bool(flags & 1)
+    expected = COMPACT_HEADER.size + n * (11 if has_thermal else 9)
+    if len(data) != expected:
+        raise MalformedFrameError(f"compact frame is {len(data):,} bytes, expected {expected:,} for {n:,} points")
+    if n and not (np.isfinite([ox, oy, oz, quantum]).all() and quantum > 0):
+        raise MalformedFrameError("compact frame has an invalid quantum/offset header")
+    off = COMPACT_HEADER.size
+    steps = []
+    for _ in range(3):
+        steps.append(np.frombuffer(data, dtype="<i2", count=n, offset=off).astype(np.int64))
+        off += 2 * n
+    thermal = None
+    if has_thermal:
+        thermal = np.frombuffer(data, dtype="<i2", count=n, offset=off)
+        off += 2 * n
+    colour = []
+    for _ in range(3):
+        colour.append(np.cumsum(np.frombuffer(data, dtype=np.uint8, count=n, offset=off).astype(np.int64)) & 0xFF)
+        off += n
+    grid = np.stack([np.cumsum(c) for c in steps], axis=1) if n else np.zeros((0, 3), np.int64)
+    xyz = (grid.astype(np.float64) * quantum + np.array([ox, oy, oz])).astype(np.float32)
+    rgb = (np.stack(colour, axis=1).astype(np.float32) / 255.0) if n else np.zeros((0, 3), np.float32)
+    temp_c = np.full(n, np.nan, dtype=np.float32)
+    if thermal is not None:
+        temp_c = (thermal.astype(np.float32) / 100.0 - 273.15).astype(np.float32)
+        temp_c[thermal == THERMAL_SENTINEL] = np.nan
+    return xyz, rgb, temp_c

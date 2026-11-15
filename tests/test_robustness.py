@@ -504,6 +504,30 @@ class PollWorkerTests(unittest.TestCase):
         self.assertTrue(any("n=3000" in p for p in paths))
         self.assertTrue(any("n=2000" in p for p in paths))
 
+    def test_compact_format_is_requested_only_after_the_rig_advertises_it(self):
+        import struct
+        import numpy as np
+        paths = []
+        grid = np.cumsum(np.ones((40, 3), np.int64), axis=0)
+
+        def compact(h):
+            d = np.diff(grid, axis=0, prepend=np.zeros((1, 3), np.int64)).astype("<i2")
+            body = struct.pack("<IIffffI", 40, len(paths), 0.0, 0.0, 0.0, 0.01, 0) + b"".join(d[:, i].tobytes() for i in range(3)) + bytes(120)
+            return body
+
+        def respond(h):
+            paths.append(h.path)
+            if "fmt=2" in h.path:
+                send(h, compact(h), headers={"X-Formats": "1,2", "ETag": f'"{len(paths)}"'})
+            else:
+                send(h, legacy_frame(40), headers={"X-Formats": "1,2", "ETag": f'"{len(paths)}"'})
+
+        w, stats, _ = self.start(respond)
+        self.assertTrue(wait_for(lambda: sum("fmt=2" in p for p in paths) >= 3))
+        self.assertNotIn("fmt=2", paths[0])                       # the first request cannot know yet
+        self.assertEqual(stats.snapshot()["frames_failed"], 0)    # and every compact reply was parsed as compact
+        self.assertGreaterEqual(stats.snapshot()["frames_received"], 3)
+
     def test_old_rigs_that_do_not_advertise_sizes_are_never_sent_a_query(self):
         paths, body = [], legacy_frame(40)
 
